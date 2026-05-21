@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: circle-discord-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/bot.sqlite3
+      - key: RETENTION_DAYS
+        value: 180
+      - key: COMMAND_PREFIX
+        value: "-"
+      - key: SYNC_GUILD_ID
+        sync: false
+      - key: OWNER_IDS
+        sync: false

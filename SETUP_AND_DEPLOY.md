@@ -107,7 +107,7 @@ RenderではWebサービスではなく、Background Workerとして動かしま
 2. RenderでNew Blueprintを選び、このリポジトリを選びます。
 3. `render.yaml` を使って `Cache` workerを作成します。
 4. 環境変数 `DISCORD_TOKEN` にBotトークンを設定します。
-5. 必要なら `SYNC_GUILD_ID` に自分のDiscordサーバーIDを設定します。
+5. 必要なら `SYNC_GUILD_ID` にDiscordサーバーIDを設定します。複数サーバーで使う場合は `123,456` のようにカンマ区切りで入れます。
 6. Deployします。
 
 この構成では `/data` に永続ディスクを付け、SQLiteログDBを `/data/bot.sqlite3` に保存します。

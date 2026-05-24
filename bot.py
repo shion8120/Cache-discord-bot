@@ -48,6 +48,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def sync_guild_ids() -> list[int]:
+    raw = ",".join(
+        value
+        for value in [os.getenv("SYNC_GUILD_IDS"), os.getenv("SYNC_GUILD_ID")]
+        if value
+    )
+    ids: list[int] = []
+    for value in raw.split(","):
+        value = value.strip()
+        if value.isdigit():
+            ids.append(int(value))
+    return list(dict.fromkeys(ids))
+
+
 def to_jst_text(value: str | None) -> str:
     if not value:
         return "-"
@@ -1101,11 +1115,13 @@ class CacheBot(discord.Client):
         await self.db.connect()
         setup_commands(self)
         self.cleanup_task = asyncio.create_task(self.cleanup_loop())
-        if SYNC_GUILD_ID and SYNC_GUILD_ID.isdigit():
-            guild = discord.Object(id=int(SYNC_GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            logger.info("Synced %s commands to guild %s", len(synced), SYNC_GUILD_ID)
+        guild_ids = sync_guild_ids()
+        if guild_ids:
+            for guild_id in guild_ids:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                logger.info("Synced %s commands to guild %s", len(synced), guild_id)
         else:
             synced = await self.tree.sync()
             logger.info("Synced %s global commands", len(synced))

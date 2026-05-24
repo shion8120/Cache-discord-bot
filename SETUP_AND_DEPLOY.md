@@ -112,6 +112,24 @@ RenderではWebサービスではなく、Background Workerとして動かしま
 
 この構成では `/data` に永続ディスクを付け、SQLiteログDBを `/data/bot.sqlite3` に保存します。
 
+### APIキーでRender設定を自動反映する場合
+
+Render DashboardのAccount SettingsでAPIキーを作成し、プロジェクト直下に `.render_api_key` という名前で保存します。このファイルはGitHubへ上がらない設定です。
+
+その後、次を実行するとCacheサービスを探し、必要な環境変数を設定して再デプロイします。
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\render_apply.py --sync-guild-id "サーバーID" --owner-ids "自分のDiscordユーザーID"
+```
+
+複数サーバーの場合:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\render_apply.py --sync-guild-id "サーバーID1,サーバーID2" --owner-ids "自分のDiscordユーザーID"
+```
+
+既存の `DISCORD_TOKEN` は上書きしません。未設定の場合だけ、結果に `missing_required_env` として表示されます。
+
 ## 5. 注意
 
 - Botのロールは、Kick/Ban/Timeoutしたい対象メンバーより上に置いてください。

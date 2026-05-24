@@ -221,6 +221,8 @@ COMMAND_PREFIX=-
 
 Discord側の権限設定とRenderの詳しい手順は [SETUP_AND_DEPLOY.md](SETUP_AND_DEPLOY.md) にまとめています。
 
+Render APIキーを使える場合は、`scripts/render_apply.py` で環境変数設定と再デプロイをまとめて実行できます。APIキーは `.render_api_key` に保存しても、`.gitignore` によりGitHubへは上がりません。
+
 ## 別サーバーへ導入する場合
 
 同じCacheを別のDiscordサーバーでも使えます。ログや設定はサーバーIDごとに分かれて保存されます。

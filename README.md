@@ -1,16 +1,19 @@
-# Discord Circle Logger Bot
+# Cache
 
-大学サークルのDiscordサーバー向けに、VC入退室、メッセージ編集・削除、必要に応じたメッセージ本文のログを保存するBotです。
+大学サークルのDiscordサーバー向けに、ログ管理、通報、警告、処罰、自動モデレーションをまとめて扱う管理サービスです。
 
-標準では、会話内容を公開ログチャンネルに丸ごと流すのではなく、SQLiteに保存して、管理権限のある人だけがスラッシュコマンドで検索・CSV出力できる方式にしています。編集・削除・VC入退室などの重要イベントは、設定したログチャンネルへ通知できます。
+標準では、メッセージ内容、画像・添付ファイル、編集・削除、リアクション、VC入退室をSQLiteに保存し、`cache-logs` にも通知します。管理権限のある人はスラッシュコマンドで検索・CSV出力できます。
 
 ## 主な機能
 
 - VC入室、退室、移動の保存と通知
 - メッセージ作成、編集、削除の保存
+- メッセージ送信内容のログチャンネル通知
+- 画像・添付ファイルの保存と通知
+- リアクション追加・削除・一括削除の保存と通知
 - 編集ログのBefore / After確認
 - 削除メッセージの確認
-- Auttaja風の `-setup` / `-warn` / `-mute` / `-kick` / `-ban` / `-purge`
+- `-setup` / `-warn` / `-mute` / `-kick` / `-ban` / `-purge` などのテキストコマンド
 - スラッシュコマンド版の警告、タイムアウト、Kick、Ban、通報
 - 自動モデレーション
   - 連投対策
@@ -22,7 +25,7 @@
 - 管理者向けのログ検索
 - CSVエクスポート
 - Discord上からログ機能のON/OFF切り替え
-- Bot状態確認
+- Cache状態確認
 - 古いログの自動整理
 
 ## セットアップ
@@ -87,24 +90,24 @@ Copy-Item .env.example .env
 サーバー内で、管理権限を持つユーザーが実行します。
 
 ```text
-/auttaja_setup
+/cache_setup
 /log_status
 ```
 
-`/auttaja_setup` は次の設定を自動作成します。
+`/cache_setup` は次の設定を自動作成します。
 
-- `Bot管理スタッフ` ロール
-- `bot-management` カテゴリ
-- `bot-logs` チャンネル
-- `mod-logs` チャンネル
+- `Cacheスタッフ` ロール
+- `cache-management` カテゴリ
+- `cache-logs` チャンネル
+- `moderation-logs` チャンネル
 - `reports` チャンネル
 - ログ保存、VCログ、編集/削除ログ、自動モデレーションの初期設定
 
-スタッフには、作成された `Bot管理スタッフ` ロールを手動で付けてください。
+スタッフには、作成された `Cacheスタッフ` ロールを手動で付けてください。
 
 ## 管理コマンド
 
-### Auttaja風テキストコマンド
+### テキストコマンド
 
 ```text
 -setup
@@ -112,12 +115,14 @@ Copy-Item .env.example .env
 -ping
 -warn @user 理由
 -warnings @user
+-unwarn 12 誤警告のため
 -clearwarns @user
 -mute @user 10m 理由
 -kick @user 理由
 -ban @user 理由
 -purge 50
 -report @user 理由
+-cancelreport 3 誤通報のため
 ```
 
 ### スラッシュコマンド
@@ -144,7 +149,7 @@ Copy-Item .env.example .env
 /log_search
 ```
 
-保存済みログを検索します。対象はメッセージ作成、編集、削除、メッセージ全体、VCから選べます。
+保存済みログを検索します。対象はメッセージ作成、編集、削除、メッセージ全体、VC、リアクションから選べます。
 
 ```text
 /log_export
@@ -153,10 +158,10 @@ Copy-Item .env.example .env
 直近1〜90日分のログをCSVで出力します。
 
 ```text
-/bot_health
+/cache_health
 ```
 
-Botの状態を確認します。
+Cacheの状態を確認します。
 
 ```text
 /automod_toggle
@@ -167,15 +172,21 @@ Botの状態を確認します。
 ```text
 /warn
 /warnings
+/unwarn
 /clearwarns
 /timeout
 /kick
 /ban
 /purge
 /report
+/report_cancel
 ```
 
 警告、処罰、削除、通報をDiscord内から実行できます。
+
+警告を1件だけ取り消す場合は、`/warnings` でCase IDを確認してから `/unwarn case_id:番号` を使います。全警告を消す場合は `/clearwarns` です。
+
+通報を取り消す場合は、通報時に表示されるReport IDを使って `/report_cancel report_id:番号` を実行します。通報は削除せず、取り消し済みとして記録を残します。
 
 ## 保存期間
 
@@ -185,7 +196,7 @@ Botの状態を確認します。
 
 会話ログは個人情報を含む可能性があります。サークル内で運用する場合は、ログ取得の目的、閲覧できる人、保存期間を明示してから導入するのがおすすめです。
 
-特定のテキストチャンネルへ全会話を転送する方式も可能ですが、閲覧権限の事故が起きやすいため、このBotでは「DB保存＋管理者コマンド検索」を標準にしています。
+`cache-logs` には会話内容や画像URLも流れます。閲覧権限の事故が起きやすいため、`cache-logs` は運営だけが見られる権限にしてください。チャンネル通知を止めたい場合は `/log_toggle` で通知投稿をOFFにできます。
 
 ## サーバーで動かす場合
 

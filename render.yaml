@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: circle-discord-bot
+    name: Cache
     runtime: docker
     plan: starter
     dockerfilePath: ./Dockerfile

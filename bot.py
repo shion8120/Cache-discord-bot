@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("circle-logger")
+logger = logging.getLogger("cache")
 
 JST = timezone(timedelta(hours=9))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3"))
@@ -69,6 +69,24 @@ def attachment_urls(message: discord.Message) -> list[str]:
     return [attachment.url for attachment in message.attachments]
 
 
+def image_attachment_url(message: discord.Message) -> str | None:
+    for attachment in message.attachments:
+        content_type = attachment.content_type or ""
+        if content_type.startswith("image/"):
+            return attachment.url
+        if attachment.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return attachment.url
+    return None
+
+
+def attachment_summary(message: discord.Message, limit: int = 700) -> str:
+    if not message.attachments:
+        return "-"
+    lines = [f"[{attachment.filename}]({attachment.url})" for attachment in message.attachments]
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 def user_label(user: discord.abc.User) -> str:
     return f"{user} ({user.id})"
 
@@ -98,7 +116,7 @@ async def is_log_manager(interaction: discord.Interaction) -> bool:
     return (
         permissions.administrator
         or permissions.manage_guild
-        or any(role.name == "Bot管理スタッフ" for role in interaction.user.roles)
+        or any(role.name in {"Cacheスタッフ", "Bot管理スタッフ"} for role in interaction.user.roles)
     )
 
 
@@ -181,6 +199,18 @@ class LogDatabase:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS reaction_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER,
+                user_name TEXT,
+                emoji TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS bot_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER,
@@ -212,6 +242,11 @@ class LogDatabase:
                 target_id INTEGER NOT NULL,
                 target_name TEXT NOT NULL,
                 reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                resolved_by_id INTEGER,
+                resolved_by_name TEXT,
+                resolved_at TEXT,
+                resolution_note TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -223,6 +258,10 @@ class LogDatabase:
                 ON voice_events (guild_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_voice_events_user
                 ON voice_events (guild_id, user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_reaction_events_guild_created
+                ON reaction_events (guild_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_reaction_events_message
+                ON reaction_events (guild_id, message_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_bot_events_guild_created
                 ON bot_events (guild_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_mod_cases_guild_target
@@ -232,6 +271,7 @@ class LogDatabase:
             """
         )
         await self.ensure_settings_columns()
+        await self.ensure_report_columns()
         await self.db.commit()
 
     async def ensure_settings_columns(self) -> None:
@@ -254,6 +294,23 @@ class LogDatabase:
             if column not in columns:
                 await self.db.execute(
                     f"ALTER TABLE guild_settings ADD COLUMN {column} {definition}"
+                )
+
+    async def ensure_report_columns(self) -> None:
+        cursor = await self.db.execute("PRAGMA table_info(reports)")
+        columns = {row["name"] for row in await cursor.fetchall()}
+        await cursor.close()
+        migrations = {
+            "status": "TEXT NOT NULL DEFAULT 'open'",
+            "resolved_by_id": "INTEGER",
+            "resolved_by_name": "TEXT",
+            "resolved_at": "TEXT",
+            "resolution_note": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                await self.db.execute(
+                    f"ALTER TABLE reports ADD COLUMN {column} {definition}"
                 )
 
     async def close(self) -> None:
@@ -594,6 +651,36 @@ class LogDatabase:
         )
         await self.db.commit()
 
+    async def record_reaction_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        user: discord.abc.User | None,
+        emoji: str,
+        event_type: str,
+    ) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO reaction_events (
+                guild_id, channel_id, message_id, user_id, user_name,
+                emoji, event_type, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                channel_id,
+                message_id,
+                user.id if user else None,
+                str(user) if user else None,
+                emoji,
+                event_type,
+                now_iso(),
+            ),
+        )
+        await self.db.commit()
+
     async def record_bot_event(
         self,
         guild_id: int | None,
@@ -698,6 +785,26 @@ class LogDatabase:
         await cursor.close()
         return rows
 
+    async def get_mod_case(self, guild_id: int, case_id: int) -> aiosqlite.Row | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM mod_cases WHERE guild_id = ? AND id = ?",
+            (guild_id, case_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+    async def remove_warning_case(self, guild_id: int, case_id: int) -> aiosqlite.Row | None:
+        row = await self.get_mod_case(guild_id, case_id)
+        if not row or row["action"] != "warn":
+            return None
+        await self.db.execute(
+            "DELETE FROM mod_cases WHERE guild_id = ? AND id = ? AND action = 'warn'",
+            (guild_id, case_id),
+        )
+        await self.db.commit()
+        return row
+
     async def clear_warnings(self, guild_id: int, target_id: int) -> int:
         cursor = await self.db.execute(
             """
@@ -710,6 +817,49 @@ class LogDatabase:
         await cursor.close()
         await self.db.commit()
         return count
+
+    async def get_report(self, guild_id: int, report_id: int) -> aiosqlite.Row | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM reports WHERE guild_id = ? AND id = ?",
+            (guild_id, report_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+    async def update_report_status(
+        self,
+        guild_id: int,
+        report_id: int,
+        status: str,
+        actor: discord.abc.User,
+        note: str,
+    ) -> aiosqlite.Row | None:
+        row = await self.get_report(guild_id, report_id)
+        if not row:
+            return None
+        await self.db.execute(
+            """
+            UPDATE reports
+            SET status = ?,
+                resolved_by_id = ?,
+                resolved_by_name = ?,
+                resolved_at = ?,
+                resolution_note = ?
+            WHERE guild_id = ? AND id = ?
+            """,
+            (
+                status,
+                actor.id,
+                str(actor),
+                now_iso(),
+                note,
+                guild_id,
+                report_id,
+            ),
+        )
+        await self.db.commit()
+        return row
 
     async def search_message_events(
         self,
@@ -782,12 +932,47 @@ class LogDatabase:
         await cursor.close()
         return rows
 
+    async def search_reaction_events(
+        self,
+        guild_id: int,
+        user_id: int | None,
+        channel_id: int | None,
+        keyword: str | None,
+        limit: int,
+    ) -> list[aiosqlite.Row]:
+        clauses = ["guild_id = ?"]
+        params: list[Any] = [guild_id]
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if channel_id:
+            clauses.append("channel_id = ?")
+            params.append(channel_id)
+        if keyword:
+            clauses.append("(emoji LIKE ? OR user_name LIKE ? OR event_type LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like, like])
+        params.append(limit)
+        cursor = await self.db.execute(
+            f"""
+            SELECT * FROM reaction_events
+            WHERE {" AND ".join(clauses)}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return rows
+
     async def stats(self, guild_id: int) -> dict[str, int]:
         result: dict[str, int] = {}
         for name, table in {
             "messages": "messages",
             "message_events": "message_events",
             "voice_events": "voice_events",
+            "reaction_events": "reaction_events",
             "bot_events": "bot_events",
             "mod_cases": "mod_cases",
             "reports": "reports",
@@ -809,6 +994,7 @@ class LogDatabase:
         for table, column in {
             "message_events": "created_at",
             "voice_events": "created_at",
+            "reaction_events": "created_at",
             "bot_events": "created_at",
             "mod_cases": "created_at",
             "reports": "created_at",
@@ -848,6 +1034,24 @@ class LogDatabase:
                 ORDER BY created_at DESC
                 LIMIT ?
             """
+        elif kind == "reactions":
+            headers = [
+                "created_at",
+                "event_type",
+                "channel_id",
+                "message_id",
+                "user_id",
+                "user_name",
+                "emoji",
+            ]
+            query = """
+                SELECT created_at, event_type, channel_id, message_id,
+                       user_id, user_name, emoji
+                FROM reaction_events
+                WHERE guild_id = ? AND created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """
         else:
             headers = [
                 "created_at",
@@ -875,13 +1079,14 @@ class LogDatabase:
         return headers, rows
 
 
-class CircleLoggerBot(discord.Client):
+class CacheBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
         intents.members = True
         intents.messages = True
         intents.message_content = True
+        intents.reactions = True
         intents.voice_states = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
@@ -1056,6 +1261,110 @@ class CircleLoggerBot(discord.Client):
         except discord.HTTPException:
             logger.exception("Failed to send moderation notification")
 
+    async def notify_message_create(self, message: discord.Message) -> None:
+        embed = discord.Embed(
+            title="メッセージ送信",
+            color=discord.Color.blurple(),
+            timestamp=message.created_at,
+        )
+        embed.add_field(name="投稿者", value=user_label(message.author), inline=False)
+        embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
+        embed.add_field(name="メッセージID", value=str(message.id), inline=True)
+        embed.add_field(name="内容", value=shorten(message.content), inline=False)
+        if message.attachments:
+            embed.add_field(name="添付ファイル", value=attachment_summary(message), inline=False)
+        if message.jump_url:
+            embed.add_field(name="リンク", value=f"[メッセージを開く]({message.jump_url})", inline=False)
+        first_image = image_attachment_url(message)
+        if first_image:
+            embed.set_image(url=first_image)
+        await self.notify(message.guild, embed)
+
+    async def notify_reaction_event(
+        self,
+        guild: discord.Guild,
+        channel_id: int,
+        message_id: int,
+        user: discord.abc.User | None,
+        emoji: str,
+        event_type: str,
+    ) -> None:
+        titles = {
+            "add": "リアクション追加",
+            "remove": "リアクション削除",
+            "clear": "リアクション全削除",
+            "clear_emoji": "リアクション絵文字削除",
+        }
+        colors = {
+            "add": discord.Color.green(),
+            "remove": discord.Color.dark_gray(),
+            "clear": discord.Color.red(),
+            "clear_emoji": discord.Color.orange(),
+        }
+        stored = await self.db.get_message(guild.id, message_id)
+        channel = guild.get_channel(channel_id)
+        channel_text = channel.mention if isinstance(channel, discord.TextChannel) else str(channel_id)
+        embed = discord.Embed(
+            title=titles.get(event_type, "リアクション"),
+            color=colors.get(event_type, discord.Color.blurple()),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="リアクション", value=emoji, inline=True)
+        embed.add_field(
+            name="操作した人",
+            value=user_label(user) if user else "-",
+            inline=False,
+        )
+        embed.add_field(name="チャンネル", value=channel_text, inline=True)
+        embed.add_field(name="メッセージID", value=str(message_id), inline=True)
+        if stored:
+            embed.add_field(
+                name="対象メッセージ投稿者",
+                value=f"{stored['author_name']} ({stored['author_id']})",
+                inline=False,
+            )
+            embed.add_field(name="対象メッセージ", value=shorten(stored["content"], 400), inline=False)
+        embed.add_field(
+            name="リンク",
+            value=f"[メッセージを開く](https://discord.com/channels/{guild.id}/{channel_id}/{message_id})",
+            inline=False,
+        )
+        await self.notify(guild, embed)
+
+    async def notify_report_status(
+        self,
+        guild: discord.Guild,
+        report: aiosqlite.Row,
+        actor: discord.abc.User,
+        status: str,
+        note: str,
+    ) -> None:
+        channel = await self.report_channel_for(guild)
+        if not channel:
+            return
+        embed = discord.Embed(
+            title=f"Report #{report['id']} | {status}",
+            color=discord.Color.dark_gray(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="通報者",
+            value=f"{report['reporter_name']} ({report['reporter_id']})",
+            inline=False,
+        )
+        embed.add_field(
+            name="対象",
+            value=f"{report['target_name']} ({report['target_id']})",
+            inline=False,
+        )
+        embed.add_field(name="元の理由", value=shorten(report["reason"], 600), inline=False)
+        embed.add_field(name="処理者", value=user_label(actor), inline=False)
+        embed.add_field(name="メモ", value=shorten(note, 600), inline=False)
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            logger.exception("Failed to send report status notification")
+
     def case_embed(
         self,
         case_id: int,
@@ -1081,7 +1390,20 @@ class CircleLoggerBot(discord.Client):
             embed.add_field(name="時間", value=f"{duration_seconds // 60}分", inline=True)
         return embed
 
-    async def run_auttaja_setup(
+    async def user_from_id(self, user_id: int) -> discord.User | discord.Member | discord.Object:
+        for guild in self.guilds:
+            member = guild.get_member(user_id)
+            if member:
+                return member
+        user = self.get_user(user_id)
+        if user:
+            return user
+        try:
+            return await self.fetch_user(user_id)
+        except discord.HTTPException:
+            return discord.Object(id=user_id)
+
+    async def run_cache_setup(
         self,
         guild: discord.Guild,
         actor: discord.abc.User,
@@ -1097,14 +1419,20 @@ class CircleLoggerBot(discord.Client):
         if missing:
             raise RuntimeError("Botに必要な権限がありません: " + ", ".join(missing))
 
-        staff_role = discord.utils.get(guild.roles, name="Bot管理スタッフ")
+        staff_role = discord.utils.get(guild.roles, name="Cacheスタッフ")
+        if staff_role is None:
+            staff_role = discord.utils.get(guild.roles, name="Bot管理スタッフ")
+            if staff_role is not None:
+                await staff_role.edit(name="Cacheスタッフ", reason=f"Cache setup by {actor}")
         if staff_role is None:
             staff_role = await guild.create_role(
-                name="Bot管理スタッフ",
+                name="Cacheスタッフ",
                 reason=f"Initial setup by {actor}",
             )
 
-        category = discord.utils.get(guild.categories, name="bot-management")
+        category = discord.utils.get(guild.categories, name="cache-management")
+        if category is None:
+            category = discord.utils.get(guild.categories, name="bot-management")
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             me: discord.PermissionOverwrite(
@@ -1124,13 +1452,17 @@ class CircleLoggerBot(discord.Client):
         }
         if category is None:
             category = await guild.create_category(
-                "bot-management",
+                "cache-management",
                 overwrites=overwrites,
                 reason=f"Initial setup by {actor}",
             )
+        elif category.name != "cache-management":
+            await category.edit(name="cache-management", reason=f"Cache setup by {actor}")
 
-        async def ensure_channel(name: str) -> discord.TextChannel:
+        async def ensure_channel(name: str, legacy_name: str | None = None) -> discord.TextChannel:
             channel = discord.utils.get(guild.text_channels, name=name)
+            if channel is None and legacy_name:
+                channel = discord.utils.get(guild.text_channels, name=legacy_name)
             if channel is None:
                 channel = await guild.create_text_channel(
                     name,
@@ -1138,10 +1470,18 @@ class CircleLoggerBot(discord.Client):
                     overwrites=overwrites,
                     reason=f"Initial setup by {actor}",
                 )
+            else:
+                edits: dict[str, Any] = {}
+                if channel.name != name:
+                    edits["name"] = name
+                if channel.category_id != category.id:
+                    edits["category"] = category
+                if edits:
+                    await channel.edit(**edits, reason=f"Cache setup by {actor}")
             return channel
 
-        bot_logs = await ensure_channel("bot-logs")
-        mod_logs = await ensure_channel("mod-logs")
+        bot_logs = await ensure_channel("cache-logs", "bot-logs")
+        mod_logs = await ensure_channel("moderation-logs", "mod-logs")
         reports = await ensure_channel("reports")
         await self.db.set_setup_channels(
             guild.id,
@@ -1153,7 +1493,7 @@ class CircleLoggerBot(discord.Client):
         await self.db.record_bot_event(
             guild.id,
             actor,
-            "auttaja_setup",
+            "cache_setup",
             {
                 "bot_logs": bot_logs.id,
                 "mod_logs": mod_logs.id,
@@ -1162,10 +1502,10 @@ class CircleLoggerBot(discord.Client):
             },
         )
         embed = discord.Embed(
-            title="Auttaja風セットアップ完了",
+            title="Cacheセットアップ完了",
             description=(
                 "ログ、モデレーションログ、通報チャンネルを作成しました。"
-                "スタッフには `Bot管理スタッフ` ロールを付けてください。"
+                "スタッフには `Cacheスタッフ` ロールを付けてください。"
             ),
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
@@ -1281,11 +1621,12 @@ class CircleLoggerBot(discord.Client):
 
         if command in {"help", "commands"}:
             embed = discord.Embed(
-                title="管理Bot コマンド",
+                title="Cache コマンド",
                 description=(
                     "`-setup`, `-ping`, `-warn @user 理由`, `-warnings @user`, "
-                    "`-clearwarns @user`, `-mute @user 10m 理由`, `-kick @user 理由`, "
-                    "`-ban @user 理由`, `-purge 50`, `-report @user 理由`"
+                    "`-unwarn case_id 理由`, `-clearwarns @user`, "
+                    "`-mute @user 10m 理由`, `-kick @user 理由`, `-ban @user 理由`, "
+                    "`-purge 50`, `-report @user 理由`, `-cancelreport report_id 理由`"
                 ),
                 color=discord.Color.blurple(),
             )
@@ -1314,7 +1655,28 @@ class CircleLoggerBot(discord.Client):
                 embed.add_field(name="対象", value=user_label(target), inline=False)
                 embed.add_field(name="理由", value=shorten(reason), inline=False)
                 await channel.send(embed=embed)
-            await message.reply("通報を受け付けました。", mention_author=False)
+            await message.reply(f"通報を受け付けました。Report #{report_id}", mention_author=False)
+            return True
+
+        if command in {"cancelreport", "closereport"}:
+            parts = args.split(maxsplit=1)
+            if not parts or not parts[0].isdigit():
+                await message.reply("例: `-cancelreport 3 誤通報のため`", mention_author=False)
+                return True
+            report_id = int(parts[0])
+            note = parts[1] if len(parts) >= 2 else "理由なし"
+            report = await self.db.get_report(message.guild.id, report_id)
+            if not report:
+                await message.reply("その通報IDは見つかりません。", mention_author=False)
+                return True
+            is_staff = isinstance(message.author, discord.Member) and await self.is_staff_member(message.author)
+            if not is_staff and report["reporter_id"] != message.author.id:
+                await message.reply("自分の通報、またはスタッフ権限のある通報だけ取り消せます。", mention_author=False)
+                return True
+            status = "closed" if command == "closereport" else "cancelled"
+            await self.db.update_report_status(message.guild.id, report_id, status, message.author, note)
+            await self.notify_report_status(message.guild, report, message.author, status, note)
+            await message.reply(f"Report #{report_id} を `{status}` にしました。", mention_author=False)
             return True
 
         if not isinstance(message.author, discord.Member) or not await self.is_staff_member(message.author):
@@ -1323,12 +1685,37 @@ class CircleLoggerBot(discord.Client):
 
         if command == "setup":
             try:
-                result = await self.run_auttaja_setup(message.guild, message.author)
+                result = await self.run_cache_setup(message.guild, message.author)
             except Exception as exc:
                 await message.reply(f"セットアップに失敗しました: {exc}", mention_author=False)
                 return True
             await message.reply(
                 f"セットアップ完了: {result['bot_logs'].mention} / {result['mod_logs'].mention} / {result['reports'].mention}",
+                mention_author=False,
+            )
+            return True
+
+        if command in {"unwarn", "removewarn"}:
+            parts = args.split(maxsplit=1)
+            if not parts or not parts[0].isdigit():
+                await message.reply("例: `-unwarn 12 誤警告のため`", mention_author=False)
+                return True
+            case_id = int(parts[0])
+            note = parts[1] if len(parts) >= 2 else "理由なし"
+            removed = await self.db.remove_warning_case(message.guild.id, case_id)
+            if not removed:
+                await message.reply("その警告Case IDは見つかりません。", mention_author=False)
+                return True
+            target = await self.user_from_id(removed["target_id"])
+            new_case_id = await self.add_case_and_notify(
+                message.guild,
+                target,
+                message.author,
+                "remove_warn",
+                f"Case #{case_id} を取り消し: {note}",
+            )
+            await message.reply(
+                f"警告 Case #{case_id} を取り消しました。記録 Case #{new_case_id}",
                 mention_author=False,
             )
             return True
@@ -1472,9 +1859,138 @@ class CircleLoggerBot(discord.Client):
         settings = await self.db.settings(message.guild.id)
         if settings["message_logging_enabled"]:
             await self.db.save_message(message)
+            await self.notify_message_create(message)
         if await self.handle_prefix_command(message):
             return
         await self.handle_automod(message)
+
+    async def user_for_reaction(self, guild: discord.Guild, user_id: int) -> discord.User | discord.Member | None:
+        member = guild.get_member(user_id)
+        if member:
+            return member
+        user = self.get_user(user_id)
+        if user:
+            return user
+        try:
+            return await self.fetch_user(user_id)
+        except discord.HTTPException:
+            return None
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if not payload.guild_id:
+            return
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        user = payload.member or await self.user_for_reaction(guild, payload.user_id)
+        if user and user.bot:
+            return
+        settings = await self.db.settings(guild.id)
+        if not settings["message_logging_enabled"]:
+            return
+        emoji = str(payload.emoji)
+        await self.db.record_reaction_event(
+            guild.id,
+            payload.channel_id,
+            payload.message_id,
+            user,
+            emoji,
+            "add",
+        )
+        await self.notify_reaction_event(
+            guild,
+            payload.channel_id,
+            payload.message_id,
+            user,
+            emoji,
+            "add",
+        )
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        if not payload.guild_id:
+            return
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        user = await self.user_for_reaction(guild, payload.user_id)
+        if user and user.bot:
+            return
+        settings = await self.db.settings(guild.id)
+        if not settings["message_logging_enabled"]:
+            return
+        emoji = str(payload.emoji)
+        await self.db.record_reaction_event(
+            guild.id,
+            payload.channel_id,
+            payload.message_id,
+            user,
+            emoji,
+            "remove",
+        )
+        await self.notify_reaction_event(
+            guild,
+            payload.channel_id,
+            payload.message_id,
+            user,
+            emoji,
+            "remove",
+        )
+
+    async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent) -> None:
+        if not payload.guild_id:
+            return
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        settings = await self.db.settings(guild.id)
+        if not settings["message_logging_enabled"]:
+            return
+        await self.db.record_reaction_event(
+            guild.id,
+            payload.channel_id,
+            payload.message_id,
+            None,
+            "*",
+            "clear",
+        )
+        await self.notify_reaction_event(
+            guild,
+            payload.channel_id,
+            payload.message_id,
+            None,
+            "*",
+            "clear",
+        )
+
+    async def on_raw_reaction_clear_emoji(
+        self,
+        payload: discord.RawReactionClearEmojiEvent,
+    ) -> None:
+        if not payload.guild_id:
+            return
+        guild = self.get_guild(payload.guild_id)
+        if not guild:
+            return
+        settings = await self.db.settings(guild.id)
+        if not settings["message_logging_enabled"]:
+            return
+        emoji = str(payload.emoji)
+        await self.db.record_reaction_event(
+            guild.id,
+            payload.channel_id,
+            payload.message_id,
+            None,
+            emoji,
+            "clear_emoji",
+        )
+        await self.notify_reaction_event(
+            guild,
+            payload.channel_id,
+            payload.message_id,
+            None,
+            emoji,
+            "clear_emoji",
+        )
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         if not payload.guild_id:
@@ -1646,7 +2162,7 @@ class CircleLoggerBot(discord.Client):
         await self.notify(member.guild, embed)
 
 
-def setup_commands(bot: CircleLoggerBot) -> None:
+def setup_commands(bot: CacheBot) -> None:
     category_choices = [
         app_commands.Choice(name="メッセージログ", value="message_logging_enabled"),
         app_commands.Choice(name="VCログ", value="voice_logging_enabled"),
@@ -1659,10 +2175,12 @@ def setup_commands(bot: CircleLoggerBot) -> None:
         app_commands.Choice(name="メッセージ削除", value="delete"),
         app_commands.Choice(name="メッセージ全体", value="messages"),
         app_commands.Choice(name="VC", value="voice"),
+        app_commands.Choice(name="リアクション", value="reactions"),
     ]
     export_choices = [
         app_commands.Choice(name="メッセージ", value="messages"),
         app_commands.Choice(name="VC", value="voice"),
+        app_commands.Choice(name="リアクション", value="reactions"),
     ]
     automod_choices = [
         app_commands.Choice(name="自動モデレーション全体", value="automod_enabled"),
@@ -1674,13 +2192,13 @@ def setup_commands(bot: CircleLoggerBot) -> None:
         app_commands.Choice(name="レイド検知", value="raid_guard_enabled"),
     ]
 
-    @bot.tree.command(name="auttaja_setup", description="Auttaja風に管理チャンネルとロールを自動作成します")
+    @bot.tree.command(name="cache_setup", description="Cacheの管理チャンネルとロールを自動作成します")
     @app_commands.guild_only()
     @manager_only()
-    async def auttaja_setup(interaction: discord.Interaction) -> None:
+    async def cache_setup(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         try:
-            result = await bot.run_auttaja_setup(interaction.guild, interaction.user)
+            result = await bot.run_cache_setup(interaction.guild, interaction.user)
         except Exception as exc:
             await interaction.followup.send(f"セットアップに失敗しました: {exc}", ephemeral=True)
             return
@@ -1770,6 +2288,34 @@ def setup_commands(bot: CircleLoggerBot) -> None:
             for row in warn_rows[:10]
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @bot.tree.command(name="unwarn", description="Case IDを指定して警告を1件取り消します")
+    @app_commands.guild_only()
+    @manager_only()
+    async def unwarn(
+        interaction: discord.Interaction,
+        case_id: int,
+        reason: str = "理由なし",
+    ) -> None:
+        removed = await bot.db.remove_warning_case(interaction.guild_id, case_id)
+        if not removed:
+            await interaction.response.send_message(
+                "その警告Case IDは見つかりません。",
+                ephemeral=True,
+            )
+            return
+        target = await bot.user_from_id(removed["target_id"])
+        new_case_id = await bot.add_case_and_notify(
+            interaction.guild,
+            target,
+            interaction.user,
+            "remove_warn",
+            f"Case #{case_id} を取り消し: {reason}",
+        )
+        await interaction.response.send_message(
+            f"警告 Case #{case_id} を取り消しました。記録 Case #{new_case_id}",
+            ephemeral=True,
+        )
 
     @bot.tree.command(name="clearwarns", description="ユーザーの警告履歴を削除します")
     @app_commands.guild_only()
@@ -1893,7 +2439,50 @@ def setup_commands(bot: CircleLoggerBot) -> None:
             embed.add_field(name="対象", value=user_label(user), inline=False)
             embed.add_field(name="理由", value=shorten(reason), inline=False)
             await channel.send(embed=embed)
-        await interaction.response.send_message("通報を受け付けました。", ephemeral=True)
+        await interaction.response.send_message(
+            f"通報を受け付けました。Report #{report_id}",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(name="report_cancel", description="通報IDを指定して通報を取り消します")
+    @app_commands.guild_only()
+    async def report_cancel(
+        interaction: discord.Interaction,
+        report_id: int,
+        reason: str = "理由なし",
+    ) -> None:
+        report_row = await bot.db.get_report(interaction.guild_id, report_id)
+        if not report_row:
+            await interaction.response.send_message("その通報IDは見つかりません。", ephemeral=True)
+            return
+        is_staff = (
+            isinstance(interaction.user, discord.Member)
+            and await bot.is_staff_member(interaction.user)
+        )
+        if not is_staff and report_row["reporter_id"] != interaction.user.id:
+            await interaction.response.send_message(
+                "自分の通報、またはスタッフ権限のある通報だけ取り消せます。",
+                ephemeral=True,
+            )
+            return
+        await bot.db.update_report_status(
+            interaction.guild_id,
+            report_id,
+            "cancelled",
+            interaction.user,
+            reason,
+        )
+        await bot.notify_report_status(
+            interaction.guild,
+            report_row,
+            interaction.user,
+            "cancelled",
+            reason,
+        )
+        await interaction.response.send_message(
+            f"Report #{report_id} を取り消しました。",
+            ephemeral=True,
+        )
 
     @bot.tree.command(name="log_setup", description="ログ通知先チャンネルを設定します")
     @app_commands.guild_only()
@@ -1961,6 +2550,7 @@ def setup_commands(bot: CircleLoggerBot) -> None:
         embed.add_field(name="保存メッセージ", value=str(stats["messages"]), inline=True)
         embed.add_field(name="メッセージイベント", value=str(stats["message_events"]), inline=True)
         embed.add_field(name="VCイベント", value=str(stats["voice_events"]), inline=True)
+        embed.add_field(name="リアクション", value=str(stats["reaction_events"]), inline=True)
         embed.add_field(name="処罰ケース", value=str(stats["mod_cases"]), inline=True)
         embed.add_field(name="通報", value=str(stats["reports"]), inline=True)
         embed.set_footer(text=f"DB: {DATABASE_PATH}")
@@ -2012,6 +2602,22 @@ def setup_commands(bot: CircleLoggerBot) -> None:
                     f"`{to_jst_text(row['created_at'])}` {row['event_type']} "
                     f"{row['user_name']} | {row['before_channel_name'] or '-'} -> "
                     f"{row['after_channel_name'] or '-'}"
+                )
+                for row in rows
+            ]
+        elif kind.value == "reactions":
+            rows = await bot.db.search_reaction_events(
+                interaction.guild_id,
+                user.id if user else None,
+                channel.id if channel else None,
+                keyword,
+                limit,
+            )
+            lines = [
+                (
+                    f"`{to_jst_text(row['created_at'])}` {row['event_type']} "
+                    f"{row['emoji']} <#{row['channel_id']}> "
+                    f"{row['user_name'] or '不明'} | message:{row['message_id']}"
                 )
                 for row in rows
             ]
@@ -2091,14 +2697,14 @@ def setup_commands(bot: CircleLoggerBot) -> None:
             ephemeral=True,
         )
 
-    @bot.tree.command(name="bot_health", description="Botの状態を確認します")
+    @bot.tree.command(name="cache_health", description="Cacheの状態を確認します")
     @app_commands.guild_only()
     @manager_only()
-    async def bot_health(interaction: discord.Interaction) -> None:
+    async def cache_health(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         stats = await bot.db.stats(interaction.guild_id)
         embed = discord.Embed(
-            title="Bot状態",
+            title="Cache状態",
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc),
         )
@@ -2109,7 +2715,7 @@ def setup_commands(bot: CircleLoggerBot) -> None:
         await bot.record_admin_action(
             interaction.guild_id,
             interaction.user,
-            "bot_health",
+            "cache_health",
             {},
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2133,7 +2739,7 @@ def setup_commands(bot: CircleLoggerBot) -> None:
 async def main() -> None:
     if not DISCORD_TOKEN or DISCORD_TOKEN == "replace_me":
         raise RuntimeError(".env に DISCORD_TOKEN を設定してください。")
-    bot = CircleLoggerBot()
+    bot = CacheBot()
     await bot.start(DISCORD_TOKEN)
 
 

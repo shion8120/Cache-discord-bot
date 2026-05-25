@@ -139,6 +139,11 @@ Copy-Item .env.example .env
 現在の設定と保存件数を確認します。
 
 ```text
+/log-setting
+```
+
+ログ設定パネルを開きます。ONにするログを選択して「確定」を押すと、そのサーバーだけの設定として保存されます。
+```text
 /log_toggle
 ```
 

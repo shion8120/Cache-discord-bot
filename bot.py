@@ -51,6 +51,27 @@ INVITE_RE = re.compile(r"(discord\.gg/|discord(?:app)?\.com/invite/)", re.IGNORE
 LINK_RE = re.compile(r"https?://", re.IGNORECASE)
 ZALGO_RE = re.compile(r"[\u0300-\u036f]{4,}")
 
+LOG_TOGGLE_OPTIONS = [
+    ("全通知投稿", "notify_events_enabled", "server-logへの投稿全体"),
+    ("メッセージ保存", "message_logging_enabled", "編集/削除のBefore保存"),
+    ("メッセージ編集ログ", "message_edit_logging_enabled", "編集Before/After"),
+    ("メッセージ削除ログ", "message_delete_logging_enabled", "削除内容"),
+    ("リアクションログ", "reaction_logging_enabled", "リアクション追加/削除"),
+    ("VCログ全体", "voice_logging_enabled", "VCログの親設定"),
+    ("VC入室ログ", "voice_join_logging_enabled", "VC参加"),
+    ("VC退室ログ", "voice_leave_logging_enabled", "VC退出"),
+    ("VC移動ログ", "voice_move_logging_enabled", "VC移動"),
+    ("メンバー参加ログ", "member_join_logging_enabled", "サーバー参加"),
+    ("メンバー退出ログ", "member_leave_logging_enabled", "サーバー退出"),
+    ("ロール作成ログ", "role_create_logging_enabled", "ロール作成"),
+    ("ロール更新ログ", "role_update_logging_enabled", "ロール権限/名前更新"),
+    ("チャンネル更新ログ", "channel_update_logging_enabled", "テキストチャンネル更新"),
+    ("処罰ログ", "moderation_logging_enabled", "warn/timeout等"),
+    ("通報ログ", "report_logging_enabled", "report関連"),
+    ("管理コマンドログ", "command_logging_enabled", "管理操作のDB記録"),
+]
+LOG_TOGGLE_COLUMNS = {column for _, column, _ in LOG_TOGGLE_OPTIONS}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -499,24 +520,7 @@ class LogDatabase:
         await self.db.commit()
 
     async def set_toggle(self, guild_id: int, column: str, enabled: bool) -> None:
-        if column not in {
-            "voice_logging_enabled",
-            "message_logging_enabled",
-            "message_edit_logging_enabled",
-            "message_delete_logging_enabled",
-            "reaction_logging_enabled",
-            "voice_join_logging_enabled",
-            "voice_leave_logging_enabled",
-            "voice_move_logging_enabled",
-            "member_join_logging_enabled",
-            "member_leave_logging_enabled",
-            "role_create_logging_enabled",
-            "role_update_logging_enabled",
-            "channel_update_logging_enabled",
-            "moderation_logging_enabled",
-            "report_logging_enabled",
-            "command_logging_enabled",
-            "notify_events_enabled",
+        if column not in LOG_TOGGLE_COLUMNS | {
             "automod_enabled",
             "anti_spam_enabled",
             "anti_invite_enabled",
@@ -530,6 +534,24 @@ class LogDatabase:
         await self.db.execute(
             f"UPDATE guild_settings SET {column} = ?, updated_at = ? WHERE guild_id = ?",
             (1 if enabled else 0, now_iso(), guild_id),
+        )
+        await self.db.commit()
+
+    async def set_log_toggles(self, guild_id: int, values: dict[str, bool]) -> None:
+        updates = {column: enabled for column, enabled in values.items() if column in LOG_TOGGLE_COLUMNS}
+        if not updates:
+            return
+        await self.ensure_guild(guild_id)
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        params = [1 if enabled else 0 for enabled in updates.values()]
+        params.extend([now_iso(), guild_id])
+        await self.db.execute(
+            f"""
+            UPDATE guild_settings
+            SET {assignments}, updated_at = ?
+            WHERE guild_id = ?
+            """,
+            params,
         )
         await self.db.commit()
 
@@ -2461,25 +2483,144 @@ class CacheBot(discord.Client):
         await self.send_server_log(after.guild, "\n".join(lines))
 
 
+class LogSettingSelect(discord.ui.Select):
+    def __init__(self, parent_view: "LogSettingView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=column,
+                description=description,
+                default=column in parent_view.selected_columns,
+            )
+            for label, column, description in LOG_TOGGLE_OPTIONS
+        ]
+        super().__init__(
+            placeholder="ONにするログを選択",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.selected_columns = set(self.values)
+        self.parent_view.refresh_items()
+        await interaction.response.edit_message(
+            embed=self.parent_view.build_embed(),
+            view=self.parent_view,
+        )
+
+
+class LogSettingView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "CacheBot",
+        guild_id: int,
+        owner_id: int,
+        settings: aiosqlite.Row,
+    ):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+        self.selected_columns = {
+            column for _, column, _ in LOG_TOGGLE_OPTIONS if settings[column]
+        }
+        self.refresh_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "このログ設定パネルを操作できるのは、コマンドを実行した人だけです。",
+            ephemeral=True,
+        )
+        return False
+
+    def refresh_items(self) -> None:
+        self.clear_items()
+        self.add_item(LogSettingSelect(self))
+
+        all_on = discord.ui.Button(label="すべてON", style=discord.ButtonStyle.secondary)
+        all_on.callback = self.enable_all
+        self.add_item(all_on)
+
+        all_off = discord.ui.Button(label="すべてOFF", style=discord.ButtonStyle.secondary)
+        all_off.callback = self.disable_all
+        self.add_item(all_off)
+
+        apply_button = discord.ui.Button(label="確定", style=discord.ButtonStyle.success)
+        apply_button.callback = self.apply
+        self.add_item(apply_button)
+
+        cancel_button = discord.ui.Button(label="キャンセル", style=discord.ButtonStyle.danger)
+        cancel_button.callback = self.cancel
+        self.add_item(cancel_button)
+
+    def build_embed(self, applied: bool = False) -> discord.Embed:
+        enabled = [
+            label for label, column, _ in LOG_TOGGLE_OPTIONS if column in self.selected_columns
+        ]
+        disabled = [
+            label for label, column, _ in LOG_TOGGLE_OPTIONS if column not in self.selected_columns
+        ]
+        embed = discord.Embed(
+            title="ログ設定" if not applied else "ログ設定を更新しました",
+            description=(
+                "ONにするログを選び、最後に「確定」を押してください。"
+                if not applied
+                else "この設定はこのサーバーだけに反映されました。"
+            ),
+            color=discord.Color.blurple() if not applied else discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="ON",
+            value="\n".join(f"- {label}" for label in enabled) or "-",
+            inline=True,
+        )
+        embed.add_field(
+            name="OFF",
+            value="\n".join(f"- {label}" for label in disabled) or "-",
+            inline=True,
+        )
+        embed.set_footer(text=f"Server ID: {self.guild_id}")
+        return embed
+
+    async def enable_all(self, interaction: discord.Interaction) -> None:
+        self.selected_columns = {column for _, column, _ in LOG_TOGGLE_OPTIONS}
+        self.refresh_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def disable_all(self, interaction: discord.Interaction) -> None:
+        self.selected_columns = set()
+        self.refresh_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def apply(self, interaction: discord.Interaction) -> None:
+        values = {
+            column: column in self.selected_columns
+            for _, column, _ in LOG_TOGGLE_OPTIONS
+        }
+        await self.bot.db.set_log_toggles(self.guild_id, values)
+        await self.bot.record_admin_action(
+            self.guild_id,
+            interaction.user,
+            "log_setting_update",
+            values,
+        )
+        await interaction.response.edit_message(embed=self.build_embed(applied=True), view=None)
+        self.stop()
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(content="ログ設定の変更をキャンセルしました。", embed=None, view=None)
+        self.stop()
+
+
 def setup_commands(bot: CacheBot) -> None:
     category_choices = [
-        app_commands.Choice(name="全通知投稿", value="notify_events_enabled"),
-        app_commands.Choice(name="メッセージ保存", value="message_logging_enabled"),
-        app_commands.Choice(name="メッセージ編集ログ", value="message_edit_logging_enabled"),
-        app_commands.Choice(name="メッセージ削除ログ", value="message_delete_logging_enabled"),
-        app_commands.Choice(name="リアクションログ", value="reaction_logging_enabled"),
-        app_commands.Choice(name="VCログ全体", value="voice_logging_enabled"),
-        app_commands.Choice(name="VC入室ログ", value="voice_join_logging_enabled"),
-        app_commands.Choice(name="VC退室ログ", value="voice_leave_logging_enabled"),
-        app_commands.Choice(name="VC移動ログ", value="voice_move_logging_enabled"),
-        app_commands.Choice(name="メンバー参加ログ", value="member_join_logging_enabled"),
-        app_commands.Choice(name="メンバー退出ログ", value="member_leave_logging_enabled"),
-        app_commands.Choice(name="ロール作成ログ", value="role_create_logging_enabled"),
-        app_commands.Choice(name="ロール更新ログ", value="role_update_logging_enabled"),
-        app_commands.Choice(name="チャンネル更新ログ", value="channel_update_logging_enabled"),
-        app_commands.Choice(name="処罰ログ", value="moderation_logging_enabled"),
-        app_commands.Choice(name="通報ログ", value="report_logging_enabled"),
-        app_commands.Choice(name="管理コマンドログ", value="command_logging_enabled"),
+        app_commands.Choice(name=label, value=column)
+        for label, column, _ in LOG_TOGGLE_OPTIONS
     ]
     search_choices = [
         app_commands.Choice(name="メッセージ作成", value="create"),
@@ -2845,26 +2986,8 @@ def setup_commands(bot: CacheBot) -> None:
         embed.add_field(name="通知先", value=log_channel, inline=False)
         embed.add_field(name="処罰ログ", value=mod_channel, inline=True)
         embed.add_field(name="通報先", value=report_channel, inline=True)
-        toggle_labels = [
-            ("全通知投稿", "notify_events_enabled"),
-            ("メッセージ保存", "message_logging_enabled"),
-            ("編集", "message_edit_logging_enabled"),
-            ("削除", "message_delete_logging_enabled"),
-            ("リアクション", "reaction_logging_enabled"),
-            ("VC全体", "voice_logging_enabled"),
-            ("VC入室", "voice_join_logging_enabled"),
-            ("VC退室", "voice_leave_logging_enabled"),
-            ("VC移動", "voice_move_logging_enabled"),
-            ("参加", "member_join_logging_enabled"),
-            ("退出", "member_leave_logging_enabled"),
-            ("ロール作成", "role_create_logging_enabled"),
-            ("ロール更新", "role_update_logging_enabled"),
-            ("チャンネル更新", "channel_update_logging_enabled"),
-            ("処罰", "moderation_logging_enabled"),
-            ("通報", "report_logging_enabled"),
-            ("管理コマンド", "command_logging_enabled"),
-            ("自動モデレーション", "automod_enabled"),
-        ]
+        toggle_labels = [(label, column) for label, column, _ in LOG_TOGGLE_OPTIONS]
+        toggle_labels.append(("自動モデレーション", "automod_enabled"))
         status_lines = [
             f"{label}: {'ON' if settings[column] else 'OFF'}"
             for label, column in toggle_labels
@@ -2878,6 +3001,15 @@ def setup_commands(bot: CacheBot) -> None:
         embed.add_field(name="通報", value=str(stats["reports"]), inline=True)
         embed.set_footer(text=f"DB: {DATABASE_PATH}")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="log-setting", description="ログ種別を選択メニューでまとめて設定します")
+    @app_commands.guild_only()
+    @manager_only()
+    async def log_setting(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        settings = await bot.db.settings(interaction.guild_id)
+        view = LogSettingView(bot, interaction.guild_id, interaction.user.id, settings)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     @bot.tree.command(name="log_toggle", description="ログ機能のON/OFFを切り替えます")
     @app_commands.guild_only()

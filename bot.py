@@ -34,6 +34,7 @@ SYNC_GUILD_ID = os.getenv("SYNC_GUILD_ID")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "180") or "0")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "-")
 SERVER_LOG_CHANNEL_NAME = os.getenv("SERVER_LOG_CHANNEL_NAME", "server-log")
+LEGACY_LOG_CHANNEL_NAMES = {"cache-logs", "bot-logs"}
 OWNER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_IDS", "").split(",")
@@ -1256,11 +1257,37 @@ class CacheBot(discord.Client):
         if server_log:
             return server_log
         channel_id = settings["log_channel_id"]
-        if not channel_id:
-            return None
-        channel = guild.get_channel(channel_id)
-        if isinstance(channel, discord.TextChannel) and channel.name == SERVER_LOG_CHANNEL_NAME:
-            return channel
+        channel = guild.get_channel(channel_id) if channel_id else None
+        if isinstance(channel, discord.TextChannel):
+            if channel.name == SERVER_LOG_CHANNEL_NAME:
+                return channel
+            if channel.name in LEGACY_LOG_CHANNEL_NAMES:
+                try:
+                    await channel.edit(
+                        name=SERVER_LOG_CHANNEL_NAME,
+                        reason="Cache server-log migration",
+                    )
+                    return channel
+                except discord.Forbidden:
+                    logger.warning("Cannot rename legacy log channel %s", channel.id)
+                except discord.HTTPException:
+                    logger.exception("Failed to rename legacy log channel %s", channel.id)
+        for legacy_name in LEGACY_LOG_CHANNEL_NAMES:
+            legacy_channel = discord.utils.get(guild.text_channels, name=legacy_name)
+            if legacy_channel:
+                try:
+                    await legacy_channel.edit(
+                        name=SERVER_LOG_CHANNEL_NAME,
+                        reason="Cache server-log migration",
+                    )
+                    return legacy_channel
+                except discord.Forbidden:
+                    logger.warning("Cannot rename legacy log channel %s", legacy_channel.id)
+                except discord.HTTPException:
+                    logger.exception(
+                        "Failed to rename legacy log channel %s",
+                        legacy_channel.id,
+                    )
         return None
 
     async def send_server_log(self, guild: discord.Guild, content: str) -> None:
@@ -1486,10 +1513,17 @@ class CacheBot(discord.Client):
         elif category.name != "cache-management":
             await category.edit(name="cache-management", reason=f"Cache setup by {actor}")
 
-        async def ensure_channel(name: str, legacy_name: str | None = None) -> discord.TextChannel:
+        async def ensure_channel(
+            name: str,
+            legacy_name: str | None = None,
+            legacy_names: tuple[str, ...] = (),
+        ) -> discord.TextChannel:
             channel = discord.utils.get(guild.text_channels, name=name)
-            if channel is None and legacy_name:
-                channel = discord.utils.get(guild.text_channels, name=legacy_name)
+            if channel is None:
+                for candidate in tuple(value for value in (legacy_name, *legacy_names) if value):
+                    channel = discord.utils.get(guild.text_channels, name=candidate)
+                    if channel is not None:
+                        break
             if channel is None:
                 channel = await guild.create_text_channel(
                     name,
@@ -1507,7 +1541,11 @@ class CacheBot(discord.Client):
                     await channel.edit(**edits, reason=f"Cache setup by {actor}")
             return channel
 
-        server_log = await ensure_channel(SERVER_LOG_CHANNEL_NAME, "cache-logs")
+        server_log = await ensure_channel(
+            SERVER_LOG_CHANNEL_NAME,
+            "cache-logs",
+            ("bot-logs",),
+        )
         await self.db.set_setup_channels(
             guild.id,
             server_log.id,

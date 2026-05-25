@@ -1356,22 +1356,6 @@ class CacheBot(discord.Client):
             lines.append(f"{field.name}: {field.value}")
         await self.send_server_log(guild, "\n".join(lines))
 
-    async def notify_message_create(self, message: discord.Message) -> None:
-        log_channel = await self.log_channel_for(message.guild)
-        if log_channel and message.channel.id == log_channel.id:
-            return
-        lines = [
-            (
-                f"Message {message.id} sent from {user_label(message.author)} "
-                f"in #{message.channel.name}:"
-            ),
-            code_block(message.content),
-        ]
-        if message.attachments:
-            lines.append("Attachments:")
-            lines.extend(f"- {attachment.filename}: {attachment.url}" for attachment in message.attachments)
-        await self.send_server_log(message.guild, "\n".join(lines))
-
     async def notify_reaction_event(
         self,
         guild: discord.Guild,
@@ -1921,7 +1905,6 @@ class CacheBot(discord.Client):
         settings = await self.db.settings(message.guild.id)
         if settings["message_logging_enabled"]:
             await self.db.save_message(message)
-            await self.notify_message_create(message)
         if await self.handle_prefix_command(message):
             return
         await self.handle_automod(message)

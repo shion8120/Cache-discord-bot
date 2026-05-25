@@ -55,28 +55,33 @@ class RenderClient:
             body = exc.read().decode("utf-8", errors="replace")
             raise SystemExit(f"Render API error {exc.code}: {body}") from exc
 
-    def list_services(self) -> list[dict[str, Any]]:
+    def list_services(self, names: list[str] | None = None) -> list[dict[str, Any]]:
         cursor = None
         services: list[dict[str, Any]] = []
         while True:
             query = {"limit": "100"}
+            if names:
+                query["name"] = ",".join(names)
             if cursor:
                 query["cursor"] = cursor
             path = "/services?" + urllib.parse.urlencode(query)
             page = self.request("GET", path)
+            if not page:
+                return services
             for item in page:
                 services.append(item["service"])
                 cursor = item.get("cursor")
-            if not cursor:
+            if not cursor or len(page) < 100:
                 return services
 
     def find_service(self, explicit_id: str | None = None) -> dict[str, Any]:
         if explicit_id:
             return self.request("GET", f"/services/{explicit_id}")
-        services = self.list_services()
+        services = self.list_services(sorted(DEFAULT_SERVICE_NAMES))
         for service in services:
             if service.get("name") in DEFAULT_SERVICE_NAMES:
                 return service
+        services = self.list_services()
         for service in services:
             repo = (service.get("repo") or "").rstrip("/")
             if repo == REPO_URL:
@@ -107,6 +112,10 @@ def main() -> None:
     parser.add_argument("--owner-ids", default=os.getenv("OWNER_IDS", ""))
     parser.add_argument("--retention-days", default=os.getenv("RETENTION_DAYS", "180"))
     parser.add_argument("--command-prefix", default=os.getenv("COMMAND_PREFIX", "-"))
+    parser.add_argument(
+        "--server-log-channel-name",
+        default=os.getenv("SERVER_LOG_CHANNEL_NAME", "server-log"),
+    )
     parser.add_argument("--no-deploy", action="store_true")
     args = parser.parse_args()
 
@@ -118,6 +127,7 @@ def main() -> None:
         "DATABASE_PATH": "/data/bot.sqlite3",
         "RETENTION_DAYS": str(args.retention_days),
         "COMMAND_PREFIX": args.command_prefix,
+        "SERVER_LOG_CHANNEL_NAME": args.server_log_channel_name,
     }
     if args.sync_guild_id:
         env_updates["SYNC_GUILD_ID"] = args.sync_guild_id

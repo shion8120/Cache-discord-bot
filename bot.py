@@ -33,6 +33,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SYNC_GUILD_ID = os.getenv("SYNC_GUILD_ID")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "180") or "0")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "-")
+SERVER_LOG_CHANNEL_NAME = os.getenv("SERVER_LOG_CHANNEL_NAME", "server-log")
 OWNER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_IDS", "").split(",")
@@ -74,9 +75,58 @@ def to_jst_text(value: str | None) -> str:
 
 def shorten(text: str | None, limit: int = 900) -> str:
     if not text:
-        return "(本文なし)"
+        return "(no content)"
     cleaned = text.replace("`", "'")
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
+
+
+def code_block(text: str | None, limit: int = 1500) -> str:
+    body = text if text else "(no content)"
+    body = body.replace("```", "`\u200b``")
+    if len(body) > limit:
+        body = body[: limit - 3] + "..."
+    return f"```\n{body}\n```"
+
+
+def allowed_text(value: bool) -> str:
+    return "Allowed" if value else "Denied"
+
+
+def channel_name(channel: discord.abc.GuildChannel | None) -> str:
+    return channel.name if channel else "Unknown"
+
+
+def actor_label(user: discord.abc.User | None) -> str:
+    return user_label(user) if user else "Unknown"
+
+
+def channel_label(channel: discord.abc.GuildChannel | None) -> str:
+    if isinstance(channel, discord.TextChannel):
+        return f"#{channel.name}"
+    return channel.name if channel else "Unknown"
+
+
+def permission_display_name(name: str) -> str:
+    aliases = {
+        "manage_emojis_and_stickers": "manage_emojis",
+        "use_external_emojis": "external_emojis",
+        "use_external_stickers": "external_stickers",
+        "use_application_commands": "use_slash_commands",
+        "use_embedded_activities": "start_embedded_activities",
+    }
+    return aliases.get(name, name)
+
+
+def role_permission_lines(
+    permissions: discord.Permissions,
+    names: list[str] | None = None,
+) -> list[str]:
+    values = dict(iter(permissions))
+    selected = names or [name for name, value in permissions if value]
+    return [
+        f"{permission_display_name(name)}: {allowed_text(bool(values.get(name)))}"
+        for name in selected
+    ]
 
 
 def attachment_urls(message: discord.Message) -> list[str]:
@@ -1161,18 +1211,13 @@ class CacheBot(discord.Client):
         joins.append(now)
         recent_joins = [ts for ts in joins if now - ts <= 60]
 
-        embed = discord.Embed(
-            title="メンバー参加",
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
+        await self.send_server_log(
+            member.guild,
+            (
+                f"{user_label(member)} has joined the server! "
+                f"There are {member.guild.member_count or len(member.guild.members)} members."
+            ),
         )
-        embed.add_field(name="ユーザー", value=user_label(member), inline=False)
-        embed.add_field(
-            name="アカウント作成",
-            value=member.created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S"),
-            inline=True,
-        )
-        await self.notify_mod(member.guild, embed)
 
         if settings["raid_guard_enabled"] and len(recent_joins) >= 8:
             reason = "60秒以内に8人以上が参加したため"
@@ -1195,21 +1240,43 @@ class CacheBot(discord.Client):
                 logger.exception("Failed to apply raid guard timeout")
 
     async def on_member_remove(self, member: discord.Member) -> None:
-        embed = discord.Embed(
-            title="メンバー退出",
-            color=discord.Color.dark_gray(),
-            timestamp=datetime.now(timezone.utc),
+        roles = ", ".join(role.name for role in member.roles) or "@everyone"
+        await self.send_server_log(
+            member.guild,
+            (
+                f"{user_label(member)} has left the server! "
+                f"There are {member.guild.member_count or len(member.guild.members)} members. "
+                f"Roles: {roles}"
+            ),
         )
-        embed.add_field(name="ユーザー", value=user_label(member), inline=False)
-        await self.notify_mod(member.guild, embed)
 
     async def log_channel_for(self, guild: discord.Guild) -> discord.TextChannel | None:
         settings = await self.db.settings(guild.id)
+        server_log = discord.utils.get(guild.text_channels, name=SERVER_LOG_CHANNEL_NAME)
+        if server_log:
+            return server_log
         channel_id = settings["log_channel_id"]
         if not channel_id:
             return None
         channel = guild.get_channel(channel_id)
-        return channel if isinstance(channel, discord.TextChannel) else None
+        if isinstance(channel, discord.TextChannel) and channel.name == SERVER_LOG_CHANNEL_NAME:
+            return channel
+        return None
+
+    async def send_server_log(self, guild: discord.Guild, content: str) -> None:
+        settings = await self.db.settings(guild.id)
+        if not settings["notify_events_enabled"]:
+            return
+        channel = await self.log_channel_for(guild)
+        if not channel:
+            return
+        try:
+            for start in range(0, len(content), 1900):
+                await channel.send(content[start : start + 1900])
+        except discord.Forbidden:
+            logger.warning("Cannot send logs to channel %s in guild %s", channel.id, guild.id)
+        except discord.HTTPException:
+            logger.exception("Failed to send server log")
 
     async def notify(self, guild: discord.Guild, embed: discord.Embed) -> None:
         settings = await self.db.settings(guild.id)
@@ -1251,50 +1318,32 @@ class CacheBot(discord.Client):
         return bool(staff_role and staff_role in member.roles)
 
     async def mod_channel_for(self, guild: discord.Guild) -> discord.TextChannel | None:
-        settings = await self.db.settings(guild.id)
-        channel_id = settings["mod_log_channel_id"] or settings["log_channel_id"]
-        if not channel_id:
-            return None
-        channel = guild.get_channel(channel_id)
-        return channel if isinstance(channel, discord.TextChannel) else None
+        return await self.log_channel_for(guild)
 
     async def report_channel_for(self, guild: discord.Guild) -> discord.TextChannel | None:
-        settings = await self.db.settings(guild.id)
-        channel_id = settings["report_channel_id"] or settings["mod_log_channel_id"]
-        if not channel_id:
-            return None
-        channel = guild.get_channel(channel_id)
-        return channel if isinstance(channel, discord.TextChannel) else None
+        return await self.log_channel_for(guild)
 
     async def notify_mod(self, guild: discord.Guild, embed: discord.Embed) -> None:
-        channel = await self.mod_channel_for(guild)
-        if not channel:
-            return
-        try:
-            await channel.send(embed=embed)
-        except discord.Forbidden:
-            logger.warning("Cannot send moderation logs to channel %s", channel.id)
-        except discord.HTTPException:
-            logger.exception("Failed to send moderation notification")
+        lines = [embed.title or "Moderation event"]
+        for field in embed.fields:
+            lines.append(f"{field.name}: {field.value}")
+        await self.send_server_log(guild, "\n".join(lines))
 
     async def notify_message_create(self, message: discord.Message) -> None:
-        embed = discord.Embed(
-            title="メッセージ送信",
-            color=discord.Color.blurple(),
-            timestamp=message.created_at,
-        )
-        embed.add_field(name="投稿者", value=user_label(message.author), inline=False)
-        embed.add_field(name="チャンネル", value=message.channel.mention, inline=True)
-        embed.add_field(name="メッセージID", value=str(message.id), inline=True)
-        embed.add_field(name="内容", value=shorten(message.content), inline=False)
+        log_channel = await self.log_channel_for(message.guild)
+        if log_channel and message.channel.id == log_channel.id:
+            return
+        lines = [
+            (
+                f"Message {message.id} sent from {user_label(message.author)} "
+                f"in #{message.channel.name}:"
+            ),
+            code_block(message.content),
+        ]
         if message.attachments:
-            embed.add_field(name="添付ファイル", value=attachment_summary(message), inline=False)
-        if message.jump_url:
-            embed.add_field(name="リンク", value=f"[メッセージを開く]({message.jump_url})", inline=False)
-        first_image = image_attachment_url(message)
-        if first_image:
-            embed.set_image(url=first_image)
-        await self.notify(message.guild, embed)
+            lines.append("Attachments:")
+            lines.extend(f"- {attachment.filename}: {attachment.url}" for attachment in message.attachments)
+        await self.send_server_log(message.guild, "\n".join(lines))
 
     async def notify_reaction_event(
         self,
@@ -1305,47 +1354,22 @@ class CacheBot(discord.Client):
         emoji: str,
         event_type: str,
     ) -> None:
-        titles = {
-            "add": "リアクション追加",
-            "remove": "リアクション削除",
-            "clear": "リアクション全削除",
-            "clear_emoji": "リアクション絵文字削除",
-        }
-        colors = {
-            "add": discord.Color.green(),
-            "remove": discord.Color.dark_gray(),
-            "clear": discord.Color.red(),
-            "clear_emoji": discord.Color.orange(),
-        }
-        stored = await self.db.get_message(guild.id, message_id)
         channel = guild.get_channel(channel_id)
-        channel_text = channel.mention if isinstance(channel, discord.TextChannel) else str(channel_id)
-        embed = discord.Embed(
-            title=titles.get(event_type, "リアクション"),
-            color=colors.get(event_type, discord.Color.blurple()),
-            timestamp=datetime.now(timezone.utc),
+        if event_type == "add":
+            action = "reacted with"
+        elif event_type == "remove":
+            action = "removed reaction"
+        elif event_type == "clear":
+            action = "cleared all reactions from"
+        else:
+            action = "cleared reaction"
+        await self.send_server_log(
+            guild,
+            (
+                f"{actor_label(user)} {action} {emoji} on Message {message_id} "
+                f"in #{channel_name(channel)}."
+            ),
         )
-        embed.add_field(name="リアクション", value=emoji, inline=True)
-        embed.add_field(
-            name="操作した人",
-            value=user_label(user) if user else "-",
-            inline=False,
-        )
-        embed.add_field(name="チャンネル", value=channel_text, inline=True)
-        embed.add_field(name="メッセージID", value=str(message_id), inline=True)
-        if stored:
-            embed.add_field(
-                name="対象メッセージ投稿者",
-                value=f"{stored['author_name']} ({stored['author_id']})",
-                inline=False,
-            )
-            embed.add_field(name="対象メッセージ", value=shorten(stored["content"], 400), inline=False)
-        embed.add_field(
-            name="リンク",
-            value=f"[メッセージを開く](https://discord.com/channels/{guild.id}/{channel_id}/{message_id})",
-            inline=False,
-        )
-        await self.notify(guild, embed)
 
     async def notify_report_status(
         self,
@@ -1355,31 +1379,18 @@ class CacheBot(discord.Client):
         status: str,
         note: str,
     ) -> None:
-        channel = await self.report_channel_for(guild)
-        if not channel:
-            return
-        embed = discord.Embed(
-            title=f"Report #{report['id']} | {status}",
-            color=discord.Color.dark_gray(),
-            timestamp=datetime.now(timezone.utc),
+        await self.send_server_log(
+            guild,
+            "\n".join(
+                [
+                    f"Report #{report['id']} {status} by {user_label(actor)}.",
+                    f"Reporter: {report['reporter_name']} ({report['reporter_id']})",
+                    f"Target: {report['target_name']} ({report['target_id']})",
+                    f"Reason: {shorten(report['reason'], 600)}",
+                    f"Note: {shorten(note, 600)}",
+                ]
+            ),
         )
-        embed.add_field(
-            name="通報者",
-            value=f"{report['reporter_name']} ({report['reporter_id']})",
-            inline=False,
-        )
-        embed.add_field(
-            name="対象",
-            value=f"{report['target_name']} ({report['target_id']})",
-            inline=False,
-        )
-        embed.add_field(name="元の理由", value=shorten(report["reason"], 600), inline=False)
-        embed.add_field(name="処理者", value=user_label(actor), inline=False)
-        embed.add_field(name="メモ", value=shorten(note, 600), inline=False)
-        try:
-            await channel.send(embed=embed)
-        except discord.HTTPException:
-            logger.exception("Failed to send report status notification")
 
     def case_embed(
         self,
@@ -1496,14 +1507,12 @@ class CacheBot(discord.Client):
                     await channel.edit(**edits, reason=f"Cache setup by {actor}")
             return channel
 
-        bot_logs = await ensure_channel("cache-logs", "bot-logs")
-        mod_logs = await ensure_channel("moderation-logs", "mod-logs")
-        reports = await ensure_channel("reports")
+        server_log = await ensure_channel(SERVER_LOG_CHANNEL_NAME, "cache-logs")
         await self.db.set_setup_channels(
             guild.id,
-            bot_logs.id,
-            mod_logs.id,
-            reports.id,
+            server_log.id,
+            server_log.id,
+            server_log.id,
             staff_role.id,
         )
         await self.db.record_bot_event(
@@ -1511,30 +1520,24 @@ class CacheBot(discord.Client):
             actor,
             "cache_setup",
             {
-                "bot_logs": bot_logs.id,
-                "mod_logs": mod_logs.id,
-                "reports": reports.id,
+                "server_log": server_log.id,
                 "staff_role": staff_role.id,
             },
         )
-        embed = discord.Embed(
-            title="Cacheセットアップ完了",
-            description=(
-                "ログ、モデレーションログ、通報チャンネルを作成しました。"
-                "スタッフには `Cacheスタッフ` ロールを付けてください。"
-            ),
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
+        await server_log.send(
+            "\n".join(
+                [
+                    "Cache setup complete.",
+                    f"Logs will be posted in {server_log.mention}.",
+                    f"Staff role: {staff_role.mention}",
+                ]
+            )
         )
-        embed.add_field(name="ログ", value=bot_logs.mention, inline=True)
-        embed.add_field(name="処罰ログ", value=mod_logs.mention, inline=True)
-        embed.add_field(name="通報", value=reports.mention, inline=True)
-        embed.add_field(name="スタッフロール", value=staff_role.mention, inline=False)
-        await mod_logs.send(embed=embed)
         return {
-            "bot_logs": bot_logs,
-            "mod_logs": mod_logs,
-            "reports": reports,
+            "server_log": server_log,
+            "bot_logs": server_log,
+            "mod_logs": server_log,
+            "reports": server_log,
             "staff_role": staff_role,
         }
 
@@ -1555,10 +1558,15 @@ class CacheBot(discord.Client):
             reason,
             duration_seconds,
         )
-        await self.notify_mod(
-            guild,
-            self.case_embed(case_id, action, target, moderator, reason, duration_seconds),
-        )
+        lines = [
+            f"Case #{case_id} {action} has been recorded.",
+            f"Target: {user_label(target)}",
+            f"Moderator: {user_label(moderator) if moderator else 'Bot'}",
+            f"Reason: {shorten(reason, 600)}",
+        ]
+        if duration_seconds:
+            lines.append(f"Duration: {duration_seconds // 60} minutes")
+        await self.send_server_log(guild, "\n".join(lines))
         return case_id
 
     async def handle_automod(self, message: discord.Message) -> None:
@@ -1660,17 +1668,17 @@ class CacheBot(discord.Client):
             target = message.mentions[0]
             reason = split_after_mention(message.content)
             report_id = await self.db.add_report(message.guild.id, message.author, target, reason)
-            channel = await self.report_channel_for(message.guild)
-            if channel:
-                embed = discord.Embed(
-                    title=f"Report #{report_id}",
-                    color=discord.Color.orange(),
-                    timestamp=datetime.now(timezone.utc),
-                )
-                embed.add_field(name="通報者", value=user_label(message.author), inline=False)
-                embed.add_field(name="対象", value=user_label(target), inline=False)
-                embed.add_field(name="理由", value=shorten(reason), inline=False)
-                await channel.send(embed=embed)
+            await self.send_server_log(
+                message.guild,
+                "\n".join(
+                    [
+                        f"Report #{report_id} has been created.",
+                        f"Reporter: {user_label(message.author)}",
+                        f"Target: {user_label(target)}",
+                        f"Reason: {shorten(reason)}",
+                    ]
+                ),
+            )
             await message.reply(f"通報を受け付けました。Report #{report_id}", mention_author=False)
             return True
 
@@ -1706,7 +1714,7 @@ class CacheBot(discord.Client):
                 await message.reply(f"セットアップに失敗しました: {exc}", mention_author=False)
                 return True
             await message.reply(
-                f"セットアップ完了: {result['bot_logs'].mention} / {result['mod_logs'].mention} / {result['reports'].mention}",
+                f"セットアップ完了: {result['server_log'].mention}",
                 mention_author=False,
             )
             return True
@@ -2077,22 +2085,21 @@ class CacheBot(discord.Client):
         )
 
         channel = guild.get_channel(payload.channel_id)
-        channel_text = channel.mention if isinstance(channel, discord.TextChannel) else str(payload.channel_id)
-        embed = discord.Embed(
-            title="メッセージ編集",
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
+        await self.send_server_log(
+            guild,
+            "\n".join(
+                [
+                    (
+                        f"ℹ Message edited from {author_name or 'Unknown'} "
+                        f"({author_id or 'Unknown'}) in {channel_label(channel)}"
+                    ),
+                    "Before:",
+                    code_block(before_content),
+                    "After:",
+                    code_block(after_content),
+                ]
+            ),
         )
-        embed.add_field(
-            name="投稿者",
-            value=f"{author_name or '不明'} ({author_id or '不明'})",
-            inline=False,
-        )
-        embed.add_field(name="チャンネル", value=channel_text, inline=True)
-        embed.add_field(name="メッセージID", value=str(payload.message_id), inline=True)
-        embed.add_field(name="Before", value=shorten(before_content), inline=False)
-        embed.add_field(name="After", value=shorten(after_content), inline=False)
-        await self.notify(guild, embed)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if not payload.guild_id:
@@ -2111,7 +2118,7 @@ class CacheBot(discord.Client):
             message_id=payload.message_id,
             cached_message=payload.cached_message,
         )
-        author = "不明"
+        author = "Unknown"
         content = None
         if payload.cached_message:
             author = user_label(payload.cached_message.author)
@@ -2121,17 +2128,18 @@ class CacheBot(discord.Client):
             content = stored["content"]
 
         channel = guild.get_channel(payload.channel_id)
-        channel_text = channel.mention if isinstance(channel, discord.TextChannel) else str(payload.channel_id)
-        embed = discord.Embed(
-            title="メッセージ削除",
-            color=discord.Color.red(),
-            timestamp=datetime.now(timezone.utc),
+        await self.send_server_log(
+            guild,
+            "\n".join(
+                [
+                    (
+                        f"Message {payload.message_id} deleted from {author} "
+                        f"in {channel_label(channel)}:"
+                    ),
+                    code_block(content),
+                ]
+            ),
         )
-        embed.add_field(name="投稿者", value=author, inline=False)
-        embed.add_field(name="チャンネル", value=channel_text, inline=True)
-        embed.add_field(name="メッセージID", value=str(payload.message_id), inline=True)
-        embed.add_field(name="削除された内容", value=shorten(content), inline=False)
-        await self.notify(guild, embed)
 
     async def on_voice_state_update(
         self,
@@ -2149,16 +2157,10 @@ class CacheBot(discord.Client):
 
         if before.channel is None and after.channel is not None:
             event_type = "join"
-            title = "VC入室"
-            color = discord.Color.green()
         elif before.channel is not None and after.channel is None:
             event_type = "leave"
-            title = "VC退室"
-            color = discord.Color.dark_gray()
         else:
             event_type = "move"
-            title = "VC移動"
-            color = discord.Color.blue()
 
         await self.db.record_voice_event(
             member.guild.id,
@@ -2167,15 +2169,158 @@ class CacheBot(discord.Client):
             before.channel,
             after.channel,
         )
-        embed = discord.Embed(
-            title=title,
-            color=color,
-            timestamp=datetime.now(timezone.utc),
+        if event_type == "join":
+            await self.send_server_log(
+                member.guild,
+                f"{user_label(member)} has joined voice in {after.channel.name}",
+            )
+        elif event_type == "leave":
+            await self.send_server_log(
+                member.guild,
+                f"{user_label(member)} has left voice channel {before.channel.name}",
+            )
+        else:
+            await self.send_server_log(
+                member.guild,
+                "\n".join(
+                    [
+                        f"{user_label(member)} has left voice channel {before.channel.name}",
+                        f"{user_label(member)} has joined voice in {after.channel.name}",
+                    ]
+                ),
+            )
+
+    async def audit_actor_for(
+        self,
+        guild: discord.Guild,
+        action: discord.AuditLogAction,
+        target_id: int,
+    ) -> discord.abc.User | None:
+        me = guild.me or (self.user and guild.get_member(self.user.id))
+        if not me or not me.guild_permissions.view_audit_log:
+            return None
+        await asyncio.sleep(1)
+        try:
+            async for entry in guild.audit_logs(limit=8, action=action):
+                entry_target_id = getattr(entry.target, "id", None)
+                if entry_target_id != target_id:
+                    continue
+                created_at = entry.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - created_at
+                if age.total_seconds() <= 30:
+                    return entry.user
+        except discord.Forbidden:
+            logger.warning("Cannot read audit logs in guild %s", guild.id)
+        except discord.HTTPException:
+            logger.exception("Failed to read audit logs in guild %s", guild.id)
+        return None
+
+    def role_update_text(
+        self,
+        before: discord.Role,
+        after: discord.Role,
+        actor: discord.abc.User | None,
+    ) -> str | None:
+        before_permissions = dict(iter(before.permissions))
+        after_permissions = dict(iter(after.permissions))
+        changed_permissions = [
+            name
+            for name, before_value in before_permissions.items()
+            if before_value != after_permissions.get(name)
+        ]
+
+        before_lines: list[str] = []
+        after_lines: list[str] = []
+        newly_allowed = [
+            name
+            for name in changed_permissions
+            if after_permissions.get(name) and not before_permissions.get(name)
+        ]
+
+        if changed_permissions:
+            before_lines = role_permission_lines(before.permissions, changed_permissions)
+            if len(newly_allowed) >= 10 and len(newly_allowed) == len(changed_permissions):
+                after_lines = [f"{len(newly_allowed)} permissions allowed."]
+            else:
+                after_lines = role_permission_lines(after.permissions, changed_permissions)
+        else:
+            watched_fields = [
+                ("name", before.name, after.name),
+                ("color", str(before.color), str(after.color)),
+                ("hoist", str(before.hoist), str(after.hoist)),
+                ("mentionable", str(before.mentionable), str(after.mentionable)),
+            ]
+            for field_name, before_value, after_value in watched_fields:
+                if before_value != after_value:
+                    before_lines.append(f"{field_name}: {before_value}")
+                    after_lines.append(f"{field_name}: {after_value}")
+
+        if not before_lines and not after_lines:
+            return None
+
+        marker = "❗" if len(newly_allowed) >= 10 else "⚠"
+        return "\n".join(
+            [
+                f"{marker} Role {after.name} has been updated by {actor_label(actor)}.",
+                "Before:",
+                code_block("\n".join(before_lines)),
+                "After:",
+                code_block("\n".join(after_lines)),
+            ]
         )
-        embed.add_field(name="ユーザー", value=user_label(member), inline=False)
-        embed.add_field(name="移動前", value=before.channel.name if before.channel else "-", inline=True)
-        embed.add_field(name="移動後", value=after.channel.name if after.channel else "-", inline=True)
-        await self.notify(member.guild, embed)
+
+    async def on_guild_role_create(self, role: discord.Role) -> None:
+        actor = await self.audit_actor_for(
+            role.guild,
+            discord.AuditLogAction.role_create,
+            role.id,
+        )
+        await self.send_server_log(
+            role.guild,
+            f"Role {role.name} has been created by {actor_label(actor)}.",
+        )
+
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role) -> None:
+        actor = await self.audit_actor_for(
+            after.guild,
+            discord.AuditLogAction.role_update,
+            after.id,
+        )
+        message = self.role_update_text(before, after, actor)
+        if message:
+            await self.send_server_log(after.guild, message)
+
+    async def on_guild_channel_update(
+        self,
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ) -> None:
+        if not isinstance(before, discord.TextChannel) or not isinstance(after, discord.TextChannel):
+            return
+        if before.name == after.name and before.category_id == after.category_id:
+            return
+
+        lines = [
+            "Text Channel Update:",
+            f"Name: {after.name} ({after.id})",
+        ]
+        if before.name != after.name:
+            lines.extend(
+                [
+                    f"Name (Before): {before.name}",
+                    f"Name (After): {after.name}",
+                ]
+            )
+        if before.category_id != after.category_id:
+            lines.extend(
+                [
+                    f"Category (Before): {channel_name(before.category)}",
+                    f"Category (After): {channel_name(after.category)}",
+                ]
+            )
+        await self.send_server_log(after.guild, "\n".join(lines))
 
 
 def setup_commands(bot: CacheBot) -> None:
@@ -2221,9 +2366,7 @@ def setup_commands(bot: CacheBot) -> None:
         await interaction.followup.send(
             (
                 "セットアップ完了です。\n"
-                f"ログ: {result['bot_logs'].mention}\n"
-                f"処罰ログ: {result['mod_logs'].mention}\n"
-                f"通報: {result['reports'].mention}\n"
+                f"ログ: {result['server_log'].mention}\n"
                 f"スタッフロール: {result['staff_role'].mention}"
             ),
             ephemeral=True,
@@ -2444,17 +2587,17 @@ def setup_commands(bot: CacheBot) -> None:
         reason: str,
     ) -> None:
         report_id = await bot.db.add_report(interaction.guild_id, interaction.user, user, reason)
-        channel = await bot.report_channel_for(interaction.guild)
-        if channel:
-            embed = discord.Embed(
-                title=f"Report #{report_id}",
-                color=discord.Color.orange(),
-                timestamp=datetime.now(timezone.utc),
-            )
-            embed.add_field(name="通報者", value=user_label(interaction.user), inline=False)
-            embed.add_field(name="対象", value=user_label(user), inline=False)
-            embed.add_field(name="理由", value=shorten(reason), inline=False)
-            await channel.send(embed=embed)
+        await bot.send_server_log(
+            interaction.guild,
+            "\n".join(
+                [
+                    f"Report #{report_id} has been created.",
+                    f"Reporter: {user_label(interaction.user)}",
+                    f"Target: {user_label(user)}",
+                    f"Reason: {shorten(reason)}",
+                ]
+            ),
+        )
         await interaction.response.send_message(
             f"通報を受け付けました。Report #{report_id}",
             ephemeral=True,
@@ -2507,6 +2650,12 @@ def setup_commands(bot: CacheBot) -> None:
         interaction: discord.Interaction,
         channel: discord.TextChannel,
     ) -> None:
+        if channel.name != SERVER_LOG_CHANNEL_NAME:
+            await interaction.response.send_message(
+                f"ログ送信先は #{SERVER_LOG_CHANNEL_NAME} のみです。/cache_setup で作成してから指定してください。",
+                ephemeral=True,
+            )
+            return
         await bot.db.set_log_channel(interaction.guild_id, channel.id)
         await bot.record_admin_action(
             interaction.guild_id,

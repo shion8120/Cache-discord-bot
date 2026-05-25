@@ -2,7 +2,7 @@
 
 大学サークルのDiscordサーバー向けに、ログ管理、通報、警告、処罰、自動モデレーションをまとめて扱う管理サービスです。
 
-標準では、メッセージ内容、画像・添付ファイル、編集・削除、リアクション、VC入退室をSQLiteに保存し、`cache-logs` にも通知します。管理権限のある人はスラッシュコマンドで検索・CSV出力できます。
+標準では、メッセージ内容、画像・添付ファイル、編集・削除、リアクション、VC入退室、メンバー参加/退出、ロール更新、テキストチャンネル更新をSQLiteに保存し、`server-log` にチャット形式で通知します。管理権限のある人はスラッシュコマンドで検索・CSV出力できます。
 
 ## 主な機能
 
@@ -13,6 +13,7 @@
 - リアクション追加・削除・一括削除の保存と通知
 - 編集ログのBefore / After確認
 - 削除メッセージの確認
+- メンバー参加/退出、ロール作成/更新、テキストチャンネル更新の通知
 - `-setup` / `-warn` / `-mute` / `-kick` / `-ban` / `-purge` などのテキストコマンド
 - スラッシュコマンド版の警告、タイムアウト、Kick、Ban、通報
 - 自動モデレーション
@@ -68,6 +69,7 @@ Copy-Item .env.example .env
 
 - Send Messages
 - Use Slash Commands
+- View Audit Log
 - Embed Links
 - Attach Files
 - Read Message History
@@ -98,9 +100,7 @@ Copy-Item .env.example .env
 
 - `Cacheスタッフ` ロール
 - `cache-management` カテゴリ
-- `cache-logs` チャンネル
-- `moderation-logs` チャンネル
-- `reports` チャンネル
+- `server-log` チャンネル
 - ログ保存、VCログ、編集/削除ログ、自動モデレーションの初期設定
 
 スタッフには、作成された `Cacheスタッフ` ロールを手動で付けてください。
@@ -196,7 +196,7 @@ Cacheの状態を確認します。
 
 会話ログは個人情報を含む可能性があります。サークル内で運用する場合は、ログ取得の目的、閲覧できる人、保存期間を明示してから導入するのがおすすめです。
 
-`cache-logs` には会話内容や画像URLも流れます。閲覧権限の事故が起きやすいため、`cache-logs` は運営だけが見られる権限にしてください。チャンネル通知を止めたい場合は `/log_toggle` で通知投稿をOFFにできます。
+`server-log` には会話内容や画像URLも流れます。閲覧権限の事故が起きやすいため、`server-log` は運営だけが見られる権限にしてください。チャンネル通知を止めたい場合は `/log_toggle` で通知投稿をOFFにできます。
 
 ## サーバーで動かす場合
 
@@ -215,6 +215,7 @@ DISCORD_TOKEN=Botトークン
 DATABASE_PATH=/data/bot.sqlite3
 RETENTION_DAYS=180
 COMMAND_PREFIX=-
+SERVER_LOG_CHANNEL_NAME=server-log
 ```
 
 `render.yaml` では `/data` に永続ディスクを付けています。SQLiteのログDBを消さないため、このディスク設定は外さないでください。

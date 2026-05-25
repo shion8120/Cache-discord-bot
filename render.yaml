@@ -17,6 +17,8 @@ services:
         value: 180
       - key: COMMAND_PREFIX
         value: "-"
+      - key: SERVER_LOG_CHANNEL_NAME
+        value: server-log
       - key: SYNC_GUILD_ID
         sync: false
       - key: OWNER_IDS

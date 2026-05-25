@@ -116,6 +116,10 @@ def main() -> None:
         "--server-log-channel-name",
         default=os.getenv("SERVER_LOG_CHANNEL_NAME", "server-log"),
     )
+    parser.add_argument(
+        "--auto-sync-all-guilds",
+        default=os.getenv("AUTO_SYNC_ALL_GUILDS", "1"),
+    )
     parser.add_argument("--no-deploy", action="store_true")
     args = parser.parse_args()
 
@@ -128,6 +132,7 @@ def main() -> None:
         "RETENTION_DAYS": str(args.retention_days),
         "COMMAND_PREFIX": args.command_prefix,
         "SERVER_LOG_CHANNEL_NAME": args.server_log_channel_name,
+        "AUTO_SYNC_ALL_GUILDS": args.auto_sync_all_guilds,
     }
     if args.sync_guild_id:
         env_updates["SYNC_GUILD_ID"] = args.sync_guild_id

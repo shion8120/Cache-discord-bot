@@ -108,7 +108,8 @@ RenderではWebサービスではなく、Background Workerとして動かしま
 4. 環境変数 `DISCORD_TOKEN` にBotトークンを設定します。
 5. 必要なら `SYNC_GUILD_ID` にDiscordサーバーIDを設定します。複数サーバーで使う場合は `123,456` のようにカンマ区切りで入れます。
 6. `SERVER_LOG_CHANNEL_NAME` は通常 `server-log` のままで大丈夫です。
-7. Deployします。
+7. `AUTO_SYNC_ALL_GUILDS` は通常 `1` のままで大丈夫です。参加済み/新規参加サーバーへスラッシュコマンドを自動同期します。
+8. Deployします。
 
 この構成では `/data` に永続ディスクを付け、SQLiteログDBを `/data/bot.sqlite3` に保存します。
 

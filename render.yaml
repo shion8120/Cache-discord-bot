@@ -19,6 +19,8 @@ services:
         value: "-"
       - key: SERVER_LOG_CHANNEL_NAME
         value: server-log
+      - key: AUTO_SYNC_ALL_GUILDS
+        value: "1"
       - key: SYNC_GUILD_ID
         sync: false
       - key: OWNER_IDS

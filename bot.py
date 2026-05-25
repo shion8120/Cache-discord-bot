@@ -35,6 +35,12 @@ RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "180") or "0")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "-")
 SERVER_LOG_CHANNEL_NAME = os.getenv("SERVER_LOG_CHANNEL_NAME", "server-log")
 LEGACY_LOG_CHANNEL_NAMES = {"cache-logs", "bot-logs"}
+AUTO_SYNC_ALL_GUILDS = os.getenv("AUTO_SYNC_ALL_GUILDS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 OWNER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_IDS", "").split(",")
@@ -1161,6 +1167,7 @@ class CacheBot(discord.Client):
             lambda: deque(maxlen=10)
         )
         self.recent_joins: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=30))
+        self.synced_guild_ids: set[int] = set()
 
     async def setup_hook(self) -> None:
         await self.db.connect()
@@ -1169,13 +1176,23 @@ class CacheBot(discord.Client):
         guild_ids = sync_guild_ids()
         if guild_ids:
             for guild_id in guild_ids:
-                guild = discord.Object(id=guild_id)
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logger.info("Synced %s commands to guild %s", len(synced), guild_id)
+                await self.sync_commands_for_guild_id(guild_id)
         else:
             synced = await self.tree.sync()
             logger.info("Synced %s global commands", len(synced))
+
+    async def sync_commands_for_guild_id(self, guild_id: int) -> None:
+        if guild_id in self.synced_guild_ids:
+            return
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
+        try:
+            synced = await self.tree.sync(guild=guild)
+        except discord.HTTPException:
+            logger.exception("Failed to sync commands to guild %s", guild_id)
+            return
+        self.synced_guild_ids.add(guild_id)
+        logger.info("Synced %s commands to guild %s", len(synced), guild_id)
 
     async def close(self) -> None:
         if self.cleanup_task:
@@ -1200,10 +1217,14 @@ class CacheBot(discord.Client):
         logger.info("Logged in as %s", self.user)
         for guild in self.guilds:
             await self.db.ensure_guild(guild.id)
+            if AUTO_SYNC_ALL_GUILDS:
+                await self.sync_commands_for_guild_id(guild.id)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self.db.ensure_guild(guild.id)
         await self.db.record_bot_event(guild.id, self.user, "guild_join", {"name": guild.name})
+        if AUTO_SYNC_ALL_GUILDS:
+            await self.sync_commands_for_guild_id(guild.id)
 
     async def on_member_join(self, member: discord.Member) -> None:
         settings = await self.db.settings(member.guild.id)

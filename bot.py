@@ -215,6 +215,19 @@ class LogDatabase:
                 staff_role_id INTEGER,
                 voice_logging_enabled INTEGER NOT NULL DEFAULT 1,
                 message_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                message_edit_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                message_delete_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                reaction_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                voice_join_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                voice_leave_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                voice_move_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                member_join_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                member_leave_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                role_create_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                role_update_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                channel_update_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                moderation_logging_enabled INTEGER NOT NULL DEFAULT 1,
+                report_logging_enabled INTEGER NOT NULL DEFAULT 1,
                 command_logging_enabled INTEGER NOT NULL DEFAULT 1,
                 notify_events_enabled INTEGER NOT NULL DEFAULT 1,
                 automod_enabled INTEGER NOT NULL DEFAULT 0,
@@ -353,6 +366,19 @@ class LogDatabase:
             "mod_log_channel_id": "INTEGER",
             "report_channel_id": "INTEGER",
             "staff_role_id": "INTEGER",
+            "message_edit_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "message_delete_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "reaction_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "voice_join_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "voice_leave_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "voice_move_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "member_join_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "member_leave_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "role_create_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "role_update_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "channel_update_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "moderation_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "report_logging_enabled": "INTEGER NOT NULL DEFAULT 1",
             "automod_enabled": "INTEGER NOT NULL DEFAULT 0",
             "anti_spam_enabled": "INTEGER NOT NULL DEFAULT 0",
             "anti_invite_enabled": "INTEGER NOT NULL DEFAULT 0",
@@ -438,6 +464,19 @@ class LogDatabase:
                 staff_role_id = ?,
                 voice_logging_enabled = 1,
                 message_logging_enabled = 1,
+                message_edit_logging_enabled = 1,
+                message_delete_logging_enabled = 1,
+                reaction_logging_enabled = 1,
+                voice_join_logging_enabled = 1,
+                voice_leave_logging_enabled = 1,
+                voice_move_logging_enabled = 1,
+                member_join_logging_enabled = 1,
+                member_leave_logging_enabled = 1,
+                role_create_logging_enabled = 1,
+                role_update_logging_enabled = 1,
+                channel_update_logging_enabled = 1,
+                moderation_logging_enabled = 1,
+                report_logging_enabled = 1,
                 command_logging_enabled = 1,
                 notify_events_enabled = 1,
                 automod_enabled = 1,
@@ -463,6 +502,19 @@ class LogDatabase:
         if column not in {
             "voice_logging_enabled",
             "message_logging_enabled",
+            "message_edit_logging_enabled",
+            "message_delete_logging_enabled",
+            "reaction_logging_enabled",
+            "voice_join_logging_enabled",
+            "voice_leave_logging_enabled",
+            "voice_move_logging_enabled",
+            "member_join_logging_enabled",
+            "member_leave_logging_enabled",
+            "role_create_logging_enabled",
+            "role_update_logging_enabled",
+            "channel_update_logging_enabled",
+            "moderation_logging_enabled",
+            "report_logging_enabled",
             "command_logging_enabled",
             "notify_events_enabled",
             "automod_enabled",
@@ -537,6 +589,7 @@ class LogDatabase:
         after_content: str | None,
         attachments: list[str],
         embeds_count: int,
+        record_event: bool = True,
     ) -> None:
         timestamp = now_iso()
         if author_id is None:
@@ -588,17 +641,20 @@ class LogDatabase:
                     timestamp,
                 ),
             )
-        await self.record_message_event(
-            guild_id=guild_id,
-            channel_id=channel_id,
-            message_id=message_id,
-            author_id=author_id,
-            author_name=author_name,
-            event_type="edit",
-            before_content=before_content,
-            after_content=after_content,
-            attachments=attachments,
-        )
+        if record_event:
+            await self.record_message_event(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                author_id=author_id,
+                author_name=author_name,
+                event_type="edit",
+                before_content=before_content,
+                after_content=after_content,
+                attachments=attachments,
+            )
+        else:
+            await self.db.commit()
 
     async def get_message(self, guild_id: int, message_id: int) -> Optional[aiosqlite.Row]:
         cursor = await self.db.execute(
@@ -615,6 +671,7 @@ class LogDatabase:
         channel_id: int,
         message_id: int,
         cached_message: discord.Message | None = None,
+        record_event: bool = True,
     ) -> Optional[aiosqlite.Row]:
         stored = await self.get_message(guild_id, message_id)
         timestamp = now_iso()
@@ -643,17 +700,20 @@ class LogDatabase:
             before_content = stored["content"]
             attachments = json.loads(stored["attachment_urls"] or "[]")
 
-        await self.record_message_event(
-            guild_id=guild_id,
-            channel_id=channel_id,
-            message_id=message_id,
-            author_id=author_id,
-            author_name=author_name,
-            event_type="delete",
-            before_content=before_content,
-            after_content=None,
-            attachments=attachments,
-        )
+        if record_event:
+            await self.record_message_event(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                author_id=author_id,
+                author_name=author_name,
+                event_type="delete",
+                before_content=before_content,
+                after_content=None,
+                attachments=attachments,
+            )
+        else:
+            await self.db.commit()
         return stored
 
     async def record_message_event(
@@ -1233,13 +1293,14 @@ class CacheBot(discord.Client):
         joins.append(now)
         recent_joins = [ts for ts in joins if now - ts <= 60]
 
-        await self.send_server_log(
-            member.guild,
-            (
-                f"{user_label(member)} has joined the server! "
-                f"There are {member.guild.member_count or len(member.guild.members)} members."
-            ),
-        )
+        if settings["member_join_logging_enabled"]:
+            await self.send_server_log(
+                member.guild,
+                (
+                    f"{user_label(member)} has joined the server! "
+                    f"There are {member.guild.member_count or len(member.guild.members)} members."
+                ),
+            )
 
         if settings["raid_guard_enabled"] and len(recent_joins) >= 8:
             reason = "60秒以内に8人以上が参加したため"
@@ -1262,6 +1323,9 @@ class CacheBot(discord.Client):
                 logger.exception("Failed to apply raid guard timeout")
 
     async def on_member_remove(self, member: discord.Member) -> None:
+        settings = await self.db.settings(member.guild.id)
+        if not settings["member_leave_logging_enabled"]:
+            return
         roles = ", ".join(role.name for role in member.roles) or "@everyone"
         await self.send_server_log(
             member.guild,
@@ -1372,6 +1436,9 @@ class CacheBot(discord.Client):
         return await self.log_channel_for(guild)
 
     async def notify_mod(self, guild: discord.Guild, embed: discord.Embed) -> None:
+        settings = await self.db.settings(guild.id)
+        if not settings["moderation_logging_enabled"]:
+            return
         lines = [embed.title or "Moderation event"]
         for field in embed.fields:
             lines.append(f"{field.name}: {field.value}")
@@ -1411,6 +1478,9 @@ class CacheBot(discord.Client):
         status: str,
         note: str,
     ) -> None:
+        settings = await self.db.settings(guild.id)
+        if not settings["report_logging_enabled"]:
+            return
         await self.send_server_log(
             guild,
             "\n".join(
@@ -1609,7 +1679,9 @@ class CacheBot(discord.Client):
         ]
         if duration_seconds:
             lines.append(f"Duration: {duration_seconds // 60} minutes")
-        await self.send_server_log(guild, "\n".join(lines))
+        settings = await self.db.settings(guild.id)
+        if settings["moderation_logging_enabled"]:
+            await self.send_server_log(guild, "\n".join(lines))
         return case_id
 
     async def handle_automod(self, message: discord.Message) -> None:
@@ -1711,17 +1783,19 @@ class CacheBot(discord.Client):
             target = message.mentions[0]
             reason = split_after_mention(message.content)
             report_id = await self.db.add_report(message.guild.id, message.author, target, reason)
-            await self.send_server_log(
-                message.guild,
-                "\n".join(
-                    [
-                        f"Report #{report_id} has been created.",
-                        f"Reporter: {user_label(message.author)}",
-                        f"Target: {user_label(target)}",
-                        f"Reason: {shorten(reason)}",
-                    ]
-                ),
-            )
+            settings = await self.db.settings(message.guild.id)
+            if settings["report_logging_enabled"]:
+                await self.send_server_log(
+                    message.guild,
+                    "\n".join(
+                        [
+                            f"Report #{report_id} has been created.",
+                            f"Reporter: {user_label(message.author)}",
+                            f"Target: {user_label(target)}",
+                            f"Reason: {shorten(reason)}",
+                        ]
+                    ),
+                )
             await message.reply(f"通報を受け付けました。Report #{report_id}", mention_author=False)
             return True
 
@@ -1952,7 +2026,7 @@ class CacheBot(discord.Client):
         if user and user.bot:
             return
         settings = await self.db.settings(guild.id)
-        if not settings["message_logging_enabled"]:
+        if not settings["message_logging_enabled"] or not settings["reaction_logging_enabled"]:
             return
         emoji = str(payload.emoji)
         await self.db.record_reaction_event(
@@ -1982,7 +2056,7 @@ class CacheBot(discord.Client):
         if user and user.bot:
             return
         settings = await self.db.settings(guild.id)
-        if not settings["message_logging_enabled"]:
+        if not settings["message_logging_enabled"] or not settings["reaction_logging_enabled"]:
             return
         emoji = str(payload.emoji)
         await self.db.record_reaction_event(
@@ -2009,7 +2083,7 @@ class CacheBot(discord.Client):
         if not guild:
             return
         settings = await self.db.settings(guild.id)
-        if not settings["message_logging_enabled"]:
+        if not settings["message_logging_enabled"] or not settings["reaction_logging_enabled"]:
             return
         await self.db.record_reaction_event(
             guild.id,
@@ -2038,7 +2112,7 @@ class CacheBot(discord.Client):
         if not guild:
             return
         settings = await self.db.settings(guild.id)
-        if not settings["message_logging_enabled"]:
+        if not settings["message_logging_enabled"] or not settings["reaction_logging_enabled"]:
             return
         emoji = str(payload.emoji)
         await self.db.record_reaction_event(
@@ -2069,6 +2143,7 @@ class CacheBot(discord.Client):
         settings = await self.db.settings(guild.id)
         if not settings["message_logging_enabled"]:
             return
+        should_log_edit = bool(settings["message_edit_logging_enabled"])
 
         stored = await self.db.get_message(guild.id, payload.message_id)
         cached = payload.cached_message
@@ -2124,7 +2199,10 @@ class CacheBot(discord.Client):
             after_content=after_content,
             attachments=after_attachments,
             embeds_count=embeds_count,
+            record_event=should_log_edit,
         )
+        if not should_log_edit:
+            return
 
         channel = guild.get_channel(payload.channel_id)
         await self.send_server_log(
@@ -2152,6 +2230,7 @@ class CacheBot(discord.Client):
         settings = await self.db.settings(guild.id)
         if not settings["message_logging_enabled"]:
             return
+        should_log_delete = bool(settings["message_delete_logging_enabled"])
         if payload.cached_message and payload.cached_message.author.bot:
             return
         stored = await self.db.mark_message_deleted(
@@ -2159,7 +2238,10 @@ class CacheBot(discord.Client):
             channel_id=payload.channel_id,
             message_id=payload.message_id,
             cached_message=payload.cached_message,
+            record_event=should_log_delete,
         )
+        if not should_log_delete:
+            return
         author = "Unknown"
         content = None
         if payload.cached_message:
@@ -2199,10 +2281,15 @@ class CacheBot(discord.Client):
 
         if before.channel is None and after.channel is not None:
             event_type = "join"
+            should_log_voice = bool(settings["voice_join_logging_enabled"])
         elif before.channel is not None and after.channel is None:
             event_type = "leave"
+            should_log_voice = bool(settings["voice_leave_logging_enabled"])
         else:
             event_type = "move"
+            should_log_voice = bool(settings["voice_move_logging_enabled"])
+        if not should_log_voice:
+            return
 
         await self.db.record_voice_event(
             member.guild.id,
@@ -2314,6 +2401,9 @@ class CacheBot(discord.Client):
         )
 
     async def on_guild_role_create(self, role: discord.Role) -> None:
+        settings = await self.db.settings(role.guild.id)
+        if not settings["role_create_logging_enabled"]:
+            return
         actor = await self.audit_actor_for(
             role.guild,
             discord.AuditLogAction.role_create,
@@ -2325,6 +2415,9 @@ class CacheBot(discord.Client):
         )
 
     async def on_guild_role_update(self, before: discord.Role, after: discord.Role) -> None:
+        settings = await self.db.settings(after.guild.id)
+        if not settings["role_update_logging_enabled"]:
+            return
         actor = await self.audit_actor_for(
             after.guild,
             discord.AuditLogAction.role_update,
@@ -2340,6 +2433,9 @@ class CacheBot(discord.Client):
         after: discord.abc.GuildChannel,
     ) -> None:
         if not isinstance(before, discord.TextChannel) or not isinstance(after, discord.TextChannel):
+            return
+        settings = await self.db.settings(after.guild.id)
+        if not settings["channel_update_logging_enabled"]:
             return
         if before.name == after.name and before.category_id == after.category_id:
             return
@@ -2367,9 +2463,22 @@ class CacheBot(discord.Client):
 
 def setup_commands(bot: CacheBot) -> None:
     category_choices = [
-        app_commands.Choice(name="メッセージログ", value="message_logging_enabled"),
-        app_commands.Choice(name="VCログ", value="voice_logging_enabled"),
-        app_commands.Choice(name="通知チャンネルへの投稿", value="notify_events_enabled"),
+        app_commands.Choice(name="全通知投稿", value="notify_events_enabled"),
+        app_commands.Choice(name="メッセージ保存", value="message_logging_enabled"),
+        app_commands.Choice(name="メッセージ編集ログ", value="message_edit_logging_enabled"),
+        app_commands.Choice(name="メッセージ削除ログ", value="message_delete_logging_enabled"),
+        app_commands.Choice(name="リアクションログ", value="reaction_logging_enabled"),
+        app_commands.Choice(name="VCログ全体", value="voice_logging_enabled"),
+        app_commands.Choice(name="VC入室ログ", value="voice_join_logging_enabled"),
+        app_commands.Choice(name="VC退室ログ", value="voice_leave_logging_enabled"),
+        app_commands.Choice(name="VC移動ログ", value="voice_move_logging_enabled"),
+        app_commands.Choice(name="メンバー参加ログ", value="member_join_logging_enabled"),
+        app_commands.Choice(name="メンバー退出ログ", value="member_leave_logging_enabled"),
+        app_commands.Choice(name="ロール作成ログ", value="role_create_logging_enabled"),
+        app_commands.Choice(name="ロール更新ログ", value="role_update_logging_enabled"),
+        app_commands.Choice(name="チャンネル更新ログ", value="channel_update_logging_enabled"),
+        app_commands.Choice(name="処罰ログ", value="moderation_logging_enabled"),
+        app_commands.Choice(name="通報ログ", value="report_logging_enabled"),
         app_commands.Choice(name="管理コマンドログ", value="command_logging_enabled"),
     ]
     search_choices = [
@@ -2629,17 +2738,19 @@ def setup_commands(bot: CacheBot) -> None:
         reason: str,
     ) -> None:
         report_id = await bot.db.add_report(interaction.guild_id, interaction.user, user, reason)
-        await bot.send_server_log(
-            interaction.guild,
-            "\n".join(
-                [
-                    f"Report #{report_id} has been created.",
-                    f"Reporter: {user_label(interaction.user)}",
-                    f"Target: {user_label(user)}",
-                    f"Reason: {shorten(reason)}",
-                ]
-            ),
-        )
+        settings = await bot.db.settings(interaction.guild_id)
+        if settings["report_logging_enabled"]:
+            await bot.send_server_log(
+                interaction.guild,
+                "\n".join(
+                    [
+                        f"Report #{report_id} has been created.",
+                        f"Reporter: {user_label(interaction.user)}",
+                        f"Target: {user_label(user)}",
+                        f"Reason: {shorten(reason)}",
+                    ]
+                ),
+            )
         await interaction.response.send_message(
             f"通報を受け付けました。Report #{report_id}",
             ephemeral=True,
@@ -2734,26 +2845,31 @@ def setup_commands(bot: CacheBot) -> None:
         embed.add_field(name="通知先", value=log_channel, inline=False)
         embed.add_field(name="処罰ログ", value=mod_channel, inline=True)
         embed.add_field(name="通報先", value=report_channel, inline=True)
-        embed.add_field(
-            name="自動モデレーション",
-            value="ON" if settings["automod_enabled"] else "OFF",
-            inline=True,
-        )
-        embed.add_field(
-            name="メッセージログ",
-            value="ON" if settings["message_logging_enabled"] else "OFF",
-            inline=True,
-        )
-        embed.add_field(
-            name="VCログ",
-            value="ON" if settings["voice_logging_enabled"] else "OFF",
-            inline=True,
-        )
-        embed.add_field(
-            name="通知投稿",
-            value="ON" if settings["notify_events_enabled"] else "OFF",
-            inline=True,
-        )
+        toggle_labels = [
+            ("全通知投稿", "notify_events_enabled"),
+            ("メッセージ保存", "message_logging_enabled"),
+            ("編集", "message_edit_logging_enabled"),
+            ("削除", "message_delete_logging_enabled"),
+            ("リアクション", "reaction_logging_enabled"),
+            ("VC全体", "voice_logging_enabled"),
+            ("VC入室", "voice_join_logging_enabled"),
+            ("VC退室", "voice_leave_logging_enabled"),
+            ("VC移動", "voice_move_logging_enabled"),
+            ("参加", "member_join_logging_enabled"),
+            ("退出", "member_leave_logging_enabled"),
+            ("ロール作成", "role_create_logging_enabled"),
+            ("ロール更新", "role_update_logging_enabled"),
+            ("チャンネル更新", "channel_update_logging_enabled"),
+            ("処罰", "moderation_logging_enabled"),
+            ("通報", "report_logging_enabled"),
+            ("管理コマンド", "command_logging_enabled"),
+            ("自動モデレーション", "automod_enabled"),
+        ]
+        status_lines = [
+            f"{label}: {'ON' if settings[column] else 'OFF'}"
+            for label, column in toggle_labels
+        ]
+        embed.add_field(name="ログON/OFF", value=code_block("\n".join(status_lines), 1000), inline=False)
         embed.add_field(name="保存メッセージ", value=str(stats["messages"]), inline=True)
         embed.add_field(name="メッセージイベント", value=str(stats["message_events"]), inline=True)
         embed.add_field(name="VCイベント", value=str(stats["voice_events"]), inline=True)

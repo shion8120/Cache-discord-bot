@@ -1406,7 +1406,7 @@ class CacheBot(discord.Client):
             return
         try:
             for start in range(0, len(content), 1900):
-                await channel.send(content[start : start + 1900])
+                await channel.send(content[start : start + 1900], silent=True)
         except discord.Forbidden:
             logger.warning("Cannot send logs to channel %s in guild %s", channel.id, guild.id)
         except discord.HTTPException:
@@ -1420,7 +1420,7 @@ class CacheBot(discord.Client):
         if not channel:
             return
         try:
-            await channel.send(embed=embed)
+            await channel.send(embed=embed, silent=True)
         except discord.Forbidden:
             logger.warning("Cannot send logs to channel %s in guild %s", channel.id, guild.id)
         except discord.HTTPException:
@@ -1666,7 +1666,8 @@ class CacheBot(discord.Client):
                     f"Logs will be posted in {server_log.mention}.",
                     f"Staff role: {staff_role.mention}",
                 ]
-            )
+            ),
+            silent=True,
         )
         return {
             "server_log": server_log,

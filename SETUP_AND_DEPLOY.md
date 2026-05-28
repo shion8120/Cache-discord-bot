@@ -134,6 +134,12 @@ Render DashboardのAccount SettingsでAPIキーを作成し、プロジェクト
 
 既存の `DISCORD_TOKEN` は上書きしません。未設定の場合だけ、結果に `missing_required_env` として表示されます。
 
+デプロイ後に `server-log` へ更新完了を出す場合は、文字化けを避けるため英数字だけの文面で次を使います。
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\post_update_log.py --service-id "RenderのService ID"
+```
+
 ## 5. 注意
 
 - Botのロールは、Kick/Ban/Timeoutしたい対象メンバーより上に置いてください。

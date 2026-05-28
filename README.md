@@ -228,6 +228,7 @@ AUTO_SYNC_ALL_GUILDS=1
 Discord側の権限設定とRenderの詳しい手順は [SETUP_AND_DEPLOY.md](SETUP_AND_DEPLOY.md) にまとめています。
 
 Render APIキーを使える場合は、`scripts/render_apply.py` で環境変数設定と再デプロイをまとめて実行できます。APIキーは `.render_api_key` に保存しても、`.gitignore` によりGitHubへは上がりません。
+デプロイ後の `server-log` 更新通知は、文字化けを避けるため `scripts/post_update_log.py` の英数字メッセージを使います。
 
 ## 別サーバーへ導入する場合
 

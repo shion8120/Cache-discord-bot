@@ -140,7 +140,24 @@ Render DashboardのAccount SettingsでAPIキーを作成し、プロジェクト
 .\.venv\Scripts\python.exe .\scripts\post_update_log.py --service-id "RenderのService ID"
 ```
 
-## 5. 注意
+## 5. ログが欠落するときの切り分け
+
+メッセージログのDB書き込みは、同時実行を直列化し、一時的なSQLiteエラーを再試行します。Renderのログに `Message log write failed after` が出る場合は、次を確認してください。
+
+1. `DATABASE_PATH` が永続ディスク上の `/data/bot.sqlite3` になっていること。
+2. 永続ディスクの空き容量と、`RETENTION_DAYS` による保存期間を確認すること。
+3. Discord Developer Portalで Message Content Intent が有効で、Botがオンラインを維持していること。
+4. Renderで同じSQLiteファイルを複数Workerから同時に使っていないこと。
+
+コード修正だけで解消しない場合の選択肢は次のとおりです。
+
+- 保存量が原因なら、永続ディスクを拡張し、保存期間を短くする。
+- 同時書き込み量が増えたなら、SQLiteからPostgreSQLなどのマネージドDBへ移行する。
+- Botの再起動やGateway切断が原因なら、常時稼働できるVPSまたは専用Workerへ移し、稼働監視と再起動設定を追加する。
+
+Botがオフラインだった時間帯や、Discord Gatewayから配信されなかったイベントは、受信処理のコードだけでは完全に復元できません。その場合は、欠落時間・再起動履歴・Discord側のイベント状況を確認し、必要に応じて保存方式そのものを見直します。
+
+## 6. 注意
 
 - Botのロールは、Kick/Ban/Timeoutしたい対象メンバーより上に置いてください。
 - `Manage Roles` は、Botより下のロールだけ操作できます。

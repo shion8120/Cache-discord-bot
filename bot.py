@@ -7,11 +7,12 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
 import aiosqlite
 import discord
@@ -41,11 +42,35 @@ AUTO_SYNC_ALL_GUILDS = os.getenv("AUTO_SYNC_ALL_GUILDS", "1").strip().lower() no
     "no",
     "off",
 }
+MESSAGE_WRITE_MAX_ATTEMPTS = max(1, int(os.getenv("MESSAGE_WRITE_MAX_ATTEMPTS", "3") or "3"))
+MESSAGE_WRITE_RETRY_BASE_SECONDS = 0.25
 OWNER_IDS = {
     int(value.strip())
     for value in os.getenv("OWNER_IDS", "").split(",")
     if value.strip().isdigit()
 }
+
+PREFIX_COMMANDS = {
+    "help",
+    "commands",
+    "ping",
+    "report",
+    "cancelreport",
+    "closereport",
+    "setup",
+    "unwarn",
+    "removewarn",
+    "warn",
+    "warnings",
+    "clearwarns",
+    "mute",
+    "timeout",
+    "kick",
+    "ban",
+    "purge",
+}
+
+WriteResult = TypeVar("WriteResult")
 
 INVITE_RE = re.compile(r"(discord\.gg/|discord(?:app)?\.com/invite/)", re.IGNORECASE)
 LINK_RE = re.compile(r"https?://", re.IGNORECASE)
@@ -220,11 +245,14 @@ class LogDatabase:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self.db = await aiosqlite.connect(self.path)
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("PRAGMA synchronous=NORMAL")
+        await self.db.execute("PRAGMA busy_timeout=10000")
         await self.db.execute("PRAGMA foreign_keys=ON")
         await self.db.executescript(
             """
@@ -436,14 +464,58 @@ class LogDatabase:
 
     async def ensure_guild(self, guild_id: int) -> None:
         timestamp = now_iso()
-        await self.db.execute(
+        cursor = await self.db.execute(
             """
             INSERT OR IGNORE INTO guild_settings (guild_id, created_at, updated_at)
             VALUES (?, ?, ?)
             """,
             (guild_id, timestamp, timestamp),
         )
-        await self.db.commit()
+        created = cursor.rowcount == 1
+        await cursor.close()
+        if created:
+            await self.db.commit()
+
+    async def _run_message_write(
+        self,
+        operation: Callable[[], Awaitable[WriteResult]],
+        description: str,
+    ) -> WriteResult:
+        for attempt in range(1, MESSAGE_WRITE_MAX_ATTEMPTS + 1):
+            try:
+                async with self.write_lock:
+                    result = await operation()
+                    await self.db.commit()
+                    return result
+            except sqlite3.OperationalError as exc:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    logger.exception("Failed to roll back message write after an error")
+                if attempt == MESSAGE_WRITE_MAX_ATTEMPTS:
+                    logger.exception(
+                        "Message log write failed after %s attempts: %s",
+                        attempt,
+                        description,
+                        exc_info=exc,
+                    )
+                    raise
+                delay = MESSAGE_WRITE_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retrying message log write (%s/%s) in %.2fs: %s",
+                    attempt + 1,
+                    MESSAGE_WRITE_MAX_ATTEMPTS,
+                    delay,
+                    description,
+                )
+                await asyncio.sleep(delay)
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    logger.exception("Failed to roll back message write after an error")
+                raise
+        raise RuntimeError("Message write retry loop ended unexpectedly")
 
     async def settings(self, guild_id: int) -> aiosqlite.Row:
         await self.ensure_guild(guild_id)
@@ -558,81 +630,9 @@ class LogDatabase:
     async def save_message(self, message: discord.Message) -> None:
         if not message.guild:
             return
-        await self.db.execute(
-            """
-            INSERT INTO messages (
-                guild_id, channel_id, message_id, author_id, author_name,
-                content, attachment_urls, embeds_count, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(guild_id, message_id) DO UPDATE SET
-                channel_id = excluded.channel_id,
-                author_id = excluded.author_id,
-                author_name = excluded.author_name,
-                content = excluded.content,
-                attachment_urls = excluded.attachment_urls,
-                embeds_count = excluded.embeds_count,
-                updated_at = excluded.updated_at,
-                deleted_at = NULL
-            """,
-            (
-                message.guild.id,
-                message.channel.id,
-                message.id,
-                message.author.id,
-                str(message.author),
-                message.content,
-                json.dumps(attachment_urls(message), ensure_ascii=False),
-                len(message.embeds),
-                message.created_at.astimezone(timezone.utc).isoformat(),
-                now_iso(),
-            ),
-        )
-        await self.record_message_event(
-            guild_id=message.guild.id,
-            channel_id=message.channel.id,
-            message_id=message.id,
-            author_id=message.author.id,
-            author_name=str(message.author),
-            event_type="create",
-            before_content=None,
-            after_content=message.content,
-            attachments=attachment_urls(message),
-        )
+        attachments = attachment_urls(message)
 
-    async def update_message_from_raw_edit(
-        self,
-        guild_id: int,
-        channel_id: int,
-        message_id: int,
-        author_id: int | None,
-        author_name: str | None,
-        before_content: str | None,
-        after_content: str | None,
-        attachments: list[str],
-        embeds_count: int,
-        record_event: bool = True,
-    ) -> None:
-        timestamp = now_iso()
-        if author_id is None:
-            await self.db.execute(
-                """
-                UPDATE messages
-                SET channel_id = ?, content = ?, attachment_urls = ?,
-                    embeds_count = ?, updated_at = ?, deleted_at = NULL
-                WHERE guild_id = ? AND message_id = ?
-                """,
-                (
-                    channel_id,
-                    after_content,
-                    json.dumps(attachments, ensure_ascii=False),
-                    embeds_count,
-                    timestamp,
-                    guild_id,
-                    message_id,
-                ),
-            )
-        else:
+        async def operation() -> None:
             await self.db.execute(
                 """
                 INSERT INTO messages (
@@ -651,32 +651,117 @@ class LogDatabase:
                     deleted_at = NULL
                 """,
                 (
-                    guild_id,
-                    channel_id,
-                    message_id,
-                    author_id,
-                    author_name or str(author_id),
-                    after_content,
+                    message.guild.id,
+                    message.channel.id,
+                    message.id,
+                    message.author.id,
+                    str(message.author),
+                    message.content,
                     json.dumps(attachments, ensure_ascii=False),
-                    embeds_count,
-                    timestamp,
-                    timestamp,
+                    len(message.embeds),
+                    message.created_at.astimezone(timezone.utc).isoformat(),
+                    now_iso(),
                 ),
             )
-        if record_event:
-            await self.record_message_event(
-                guild_id=guild_id,
-                channel_id=channel_id,
-                message_id=message_id,
-                author_id=author_id,
-                author_name=author_name,
-                event_type="edit",
-                before_content=before_content,
-                after_content=after_content,
+            await self._record_message_event(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                author_id=message.author.id,
+                author_name=str(message.author),
+                event_type="create",
+                before_content=None,
+                after_content=message.content,
                 attachments=attachments,
             )
-        else:
-            await self.db.commit()
+
+        await self._run_message_write(
+            operation,
+            f"create guild={message.guild.id} message={message.id}",
+        )
+
+    async def update_message_from_raw_edit(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        author_id: int | None,
+        author_name: str | None,
+        before_content: str | None,
+        after_content: str | None,
+        attachments: list[str],
+        embeds_count: int,
+        record_event: bool = True,
+    ) -> None:
+        timestamp = now_iso()
+
+        async def operation() -> None:
+            if author_id is None:
+                await self.db.execute(
+                    """
+                    UPDATE messages
+                    SET channel_id = ?, content = ?, attachment_urls = ?,
+                        embeds_count = ?, updated_at = ?, deleted_at = NULL
+                    WHERE guild_id = ? AND message_id = ?
+                    """,
+                    (
+                        channel_id,
+                        after_content,
+                        json.dumps(attachments, ensure_ascii=False),
+                        embeds_count,
+                        timestamp,
+                        guild_id,
+                        message_id,
+                    ),
+                )
+            else:
+                await self.db.execute(
+                    """
+                    INSERT INTO messages (
+                        guild_id, channel_id, message_id, author_id, author_name,
+                        content, attachment_urls, embeds_count, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, message_id) DO UPDATE SET
+                        channel_id = excluded.channel_id,
+                        author_id = excluded.author_id,
+                        author_name = excluded.author_name,
+                        content = excluded.content,
+                        attachment_urls = excluded.attachment_urls,
+                        embeds_count = excluded.embeds_count,
+                        updated_at = excluded.updated_at,
+                        deleted_at = NULL
+                    """,
+                    (
+                        guild_id,
+                        channel_id,
+                        message_id,
+                        author_id,
+                        author_name or str(author_id),
+                        after_content,
+                        json.dumps(attachments, ensure_ascii=False),
+                        embeds_count,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            if record_event:
+                await self._record_message_event(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    author_id=author_id,
+                    author_name=author_name,
+                    event_type="edit",
+                    before_content=before_content,
+                    after_content=after_content,
+                    attachments=attachments,
+                )
+
+        await self._run_message_write(
+            operation,
+            f"edit guild={guild_id} message={message_id}",
+        )
 
     async def get_message(self, guild_id: int, message_id: int) -> Optional[aiosqlite.Row]:
         cursor = await self.db.execute(
@@ -695,50 +780,59 @@ class LogDatabase:
         cached_message: discord.Message | None = None,
         record_event: bool = True,
     ) -> Optional[aiosqlite.Row]:
-        stored = await self.get_message(guild_id, message_id)
-        timestamp = now_iso()
-        await self.db.execute(
-            """
-            UPDATE messages
-            SET deleted_at = ?, updated_at = ?
-            WHERE guild_id = ? AND message_id = ?
-            """,
-            (timestamp, timestamp, guild_id, message_id),
+        async def operation() -> Optional[aiosqlite.Row]:
+            cursor = await self.db.execute(
+                "SELECT * FROM messages WHERE guild_id = ? AND message_id = ?",
+                (guild_id, message_id),
+            )
+            stored = await cursor.fetchone()
+            await cursor.close()
+            timestamp = now_iso()
+            await self.db.execute(
+                """
+                UPDATE messages
+                SET deleted_at = ?, updated_at = ?
+                WHERE guild_id = ? AND message_id = ?
+                """,
+                (timestamp, timestamp, guild_id, message_id),
+            )
+
+            author_id: int | None = None
+            author_name: str | None = None
+            before_content: str | None = None
+            attachments: list[str] = []
+
+            if cached_message:
+                author_id = cached_message.author.id
+                author_name = str(cached_message.author)
+                before_content = cached_message.content
+                attachments = attachment_urls(cached_message)
+            elif stored:
+                author_id = stored["author_id"]
+                author_name = stored["author_name"]
+                before_content = stored["content"]
+                attachments = json.loads(stored["attachment_urls"] or "[]")
+
+            if record_event:
+                await self._record_message_event(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    author_id=author_id,
+                    author_name=author_name,
+                    event_type="delete",
+                    before_content=before_content,
+                    after_content=None,
+                    attachments=attachments,
+                )
+            return stored
+
+        return await self._run_message_write(
+            operation,
+            f"delete guild={guild_id} message={message_id}",
         )
 
-        author_id: int | None = None
-        author_name: str | None = None
-        before_content: str | None = None
-        attachments: list[str] = []
-
-        if cached_message:
-            author_id = cached_message.author.id
-            author_name = str(cached_message.author)
-            before_content = cached_message.content
-            attachments = attachment_urls(cached_message)
-        elif stored:
-            author_id = stored["author_id"]
-            author_name = stored["author_name"]
-            before_content = stored["content"]
-            attachments = json.loads(stored["attachment_urls"] or "[]")
-
-        if record_event:
-            await self.record_message_event(
-                guild_id=guild_id,
-                channel_id=channel_id,
-                message_id=message_id,
-                author_id=author_id,
-                author_name=author_name,
-                event_type="delete",
-                before_content=before_content,
-                after_content=None,
-                attachments=attachments,
-            )
-        else:
-            await self.db.commit()
-        return stored
-
-    async def record_message_event(
+    async def _record_message_event(
         self,
         guild_id: int,
         channel_id: int,
@@ -771,7 +865,36 @@ class LogDatabase:
                 now_iso(),
             ),
         )
-        await self.db.commit()
+
+    async def record_message_event(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        author_id: int | None,
+        author_name: str | None,
+        event_type: str,
+        before_content: str | None,
+        after_content: str | None,
+        attachments: list[str],
+    ) -> None:
+        async def operation() -> None:
+            await self._record_message_event(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                author_id=author_id,
+                author_name=author_name,
+                event_type=event_type,
+                before_content=before_content,
+                after_content=after_content,
+                attachments=attachments,
+            )
+
+        await self._run_message_write(
+            operation,
+            f"event={event_type} guild={guild_id} message={message_id}",
+        )
 
     async def record_voice_event(
         self,
@@ -1780,6 +1903,8 @@ class CacheBot(discord.Client):
             return False
         command, _, args = raw.partition(" ")
         command = command.lower()
+        if command not in PREFIX_COMMANDS:
+            return False
 
         if command in {"help", "commands"}:
             embed = discord.Embed(
@@ -2020,9 +2145,20 @@ class CacheBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if not message.guild or message.author.bot:
             return
-        settings = await self.db.settings(message.guild.id)
+        try:
+            settings = await self.db.settings(message.guild.id)
+        except Exception:
+            logger.exception("Failed to load settings for guild %s", message.guild.id)
+            return
         if settings["message_logging_enabled"]:
-            await self.db.save_message(message)
+            try:
+                await self.db.save_message(message)
+            except Exception:
+                logger.exception(
+                    "Message log was not persisted after retries: guild=%s message=%s",
+                    message.guild.id,
+                    message.id,
+                )
         if await self.handle_prefix_command(message):
             return
         await self.handle_automod(message)
@@ -2163,12 +2299,24 @@ class CacheBot(discord.Client):
         guild = self.get_guild(payload.guild_id)
         if not guild:
             return
-        settings = await self.db.settings(guild.id)
+        try:
+            settings = await self.db.settings(guild.id)
+        except Exception:
+            logger.exception("Failed to load edit-log settings for guild %s", guild.id)
+            return
         if not settings["message_logging_enabled"]:
             return
         should_log_edit = bool(settings["message_edit_logging_enabled"])
 
-        stored = await self.db.get_message(guild.id, payload.message_id)
+        try:
+            stored = await self.db.get_message(guild.id, payload.message_id)
+        except Exception:
+            logger.exception(
+                "Failed to read stored message before edit: guild=%s message=%s",
+                guild.id,
+                payload.message_id,
+            )
+            return
         cached = payload.cached_message
         if cached and cached.author.bot:
             return
@@ -2212,18 +2360,26 @@ class CacheBot(discord.Client):
 
         if before_content == after_content and before_attachments == after_attachments:
             return
-        await self.db.update_message_from_raw_edit(
-            guild_id=guild.id,
-            channel_id=payload.channel_id,
-            message_id=payload.message_id,
-            author_id=author_id,
-            author_name=author_name,
-            before_content=before_content,
-            after_content=after_content,
-            attachments=after_attachments,
-            embeds_count=embeds_count,
-            record_event=should_log_edit,
-        )
+        try:
+            await self.db.update_message_from_raw_edit(
+                guild_id=guild.id,
+                channel_id=payload.channel_id,
+                message_id=payload.message_id,
+                author_id=author_id,
+                author_name=author_name,
+                before_content=before_content,
+                after_content=after_content,
+                attachments=after_attachments,
+                embeds_count=embeds_count,
+                record_event=should_log_edit,
+            )
+        except Exception:
+            logger.exception(
+                "Message edit log was not persisted after retries: guild=%s message=%s",
+                guild.id,
+                payload.message_id,
+            )
+            return
         if not should_log_edit:
             return
 
@@ -2250,19 +2406,31 @@ class CacheBot(discord.Client):
         guild = self.get_guild(payload.guild_id)
         if not guild:
             return
-        settings = await self.db.settings(guild.id)
+        try:
+            settings = await self.db.settings(guild.id)
+        except Exception:
+            logger.exception("Failed to load delete-log settings for guild %s", guild.id)
+            return
         if not settings["message_logging_enabled"]:
             return
         should_log_delete = bool(settings["message_delete_logging_enabled"])
         if payload.cached_message and payload.cached_message.author.bot:
             return
-        stored = await self.db.mark_message_deleted(
-            guild_id=guild.id,
-            channel_id=payload.channel_id,
-            message_id=payload.message_id,
-            cached_message=payload.cached_message,
-            record_event=should_log_delete,
-        )
+        try:
+            stored = await self.db.mark_message_deleted(
+                guild_id=guild.id,
+                channel_id=payload.channel_id,
+                message_id=payload.message_id,
+                cached_message=payload.cached_message,
+                record_event=should_log_delete,
+            )
+        except Exception:
+            logger.exception(
+                "Message delete log was not persisted after retries: guild=%s message=%s",
+                guild.id,
+                payload.message_id,
+            )
+            return
         if not should_log_delete:
             return
         author = "Unknown"
